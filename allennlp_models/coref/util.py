@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Union
 
 from allennlp.data.fields import (
     Field,
@@ -22,6 +22,7 @@ def make_coref_instance(
     wordpiece_modeling_tokenizer: PretrainedTransformerTokenizer = None,
     max_sentences: int = None,
     remove_singleton_clusters: bool = True,
+    span_label_map: Dict[Tuple[int,int], str] = None,
 ) -> Instance:
 
     """
@@ -112,10 +113,10 @@ def make_coref_instance(
                 cluster_dict[tuple(mention)] = cluster_id
 
     spans: List[Field] = []
-    span_labels: Optional[List[int]] = [] if gold_clusters is not None else None
+    span_labels: Optional[List[Union[int,str]]] = [] # if gold_clusters is not None else None
 
     sentence_offset = 0
-    for sentence in sentences:
+    for sent_index, sentence in enumerate(sentences):
         for start, end in enumerate_spans(
             sentence, offset=sentence_offset, max_span_width=max_span_width
         ):
@@ -143,6 +144,11 @@ def make_coref_instance(
                     span_labels.append(cluster_dict[(start, end)])
                 else:
                     span_labels.append(-1)
+            if span_label_map is not None:
+                if (start, end) in span_label_map:
+                    span_labels[-1] = span_label_map[(start, end)]
+                else:
+                    span_labels[-1] = "O"
 
             spans.append(SpanField(start, end, text_field))
         sentence_offset += len(sentence)
@@ -160,7 +166,7 @@ def make_coref_instance(
         "metadata": metadata_field,
     }
     if span_labels is not None:
-        fields["span_labels"] = SequenceLabelField(span_labels, span_field)
+        fields["span_labels"] = SequenceLabelField(span_labels, span_field, label_namespace="span_labels")
 
     return Instance(fields)
 

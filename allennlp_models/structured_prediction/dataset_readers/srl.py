@@ -3,15 +3,17 @@ from typing import Dict, List, Iterable, Tuple, Any
 
 from overrides import overrides
 from transformers.tokenization_bert import BertTokenizer
+import numpy as np
 
 from allennlp.common.file_utils import cached_path
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
-from allennlp.data.fields import Field, TextField, SequenceLabelField, MetadataField
+from allennlp.data.fields import Field, TextField, SequenceLabelField, MetadataField, ArrayField
 from allennlp.data.instance import Instance
 from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer
-from allennlp.data.tokenizers import Token
+from allennlp.data.tokenizers import Token, PretrainedTransformerTokenizer
 from allennlp_models.common.ontonotes import Ontonotes, OntonotesSentence
 
+from allennlp_models.coref.util import make_coref_instance
 
 logger = logging.getLogger(__name__)
 
@@ -130,14 +132,20 @@ class SrlReader(DatasetReader):
         token_indexers: Dict[str, TokenIndexer] = None,
         domain_identifier: str = None,
         bert_model_name: str = None,
+        with_spans: bool = False,
+        limit: int = -1,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer()}
         self._domain_identifier = domain_identifier
+        self._with_spans = with_spans
+        self._limit = limit
 
         if bert_model_name is not None:
             self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+            if with_spans:
+                self.bert_tokenizer_allennlp = PretrainedTransformerTokenizer(model_name=bert_model_name)
             self.lowercase_input = "uncased" in bert_model_name
         else:
             self.bert_tokenizer = None
@@ -192,7 +200,7 @@ class SrlReader(DatasetReader):
             end_offsets.append(cumulative)
             word_piece_tokens.extend(word_pieces)
 
-        wordpieces = ["[CLS]"] + word_piece_tokens + ["[SEP]"]
+        wordpieces = [self.bert_tokenizer.cls_token] + word_piece_tokens + [self.bert_tokenizer.sep_token]
 
         return wordpieces, end_offsets, start_offsets
 
@@ -208,17 +216,25 @@ class SrlReader(DatasetReader):
                 self._domain_identifier,
             )
 
-        for sentence in self._ontonotes_subset(
+        count = 0
+        for index, sentence in enumerate(self._ontonotes_subset(
             ontonotes_reader, file_path, self._domain_identifier
-        ):
+        )):
+            if self._limit > 0 and count >= self._limit:
+                break
             tokens = [Token(t) for t in sentence.words]
             if not sentence.srl_frames:
                 # Sentence contains no predicates.
                 tags = ["O" for _ in tokens]
                 verb_label = [0 for _ in tokens]
+                continue
+                count += 1
                 yield self.text_to_instance(tokens, verb_label, tags)
             else:
                 for (_, tags) in sentence.srl_frames:
+                    if self._limit > 0 and count >= self._limit:
+                        break
+                    count += 1
                     verb_indicator = [1 if label[-2:] == "-V" else 0 for label in tags]
                     yield self.text_to_instance(tokens, verb_indicator, tags)
 
@@ -243,13 +259,17 @@ class SrlReader(DatasetReader):
         one-hot binary vector, the same length as the tokens, indicating the position of the verb
         to find arguments for.
         """
-
         metadata_dict: Dict[str, Any] = {}
         if self.bert_tokenizer is not None:
             wordpieces, offsets, start_offsets = self._wordpiece_tokenize_input(
                 [t.text for t in tokens]
             )
             new_verbs = _convert_verb_indices_to_wordpiece_indices(verb_label, offsets)
+            if not self._with_spans:
+                verb_tokens = [token for token, v in zip(wordpieces, new_verbs) if v == 1]
+                wordpieces += verb_tokens+[self.bert_tokenizer.sep_token]
+                new_verbs += [0 for _ in range(len(verb_tokens)+1)]
+            sep_index = wordpieces.index(self.bert_tokenizer.sep_token)
             metadata_dict["offsets"] = start_offsets
             # In order to override the indexing mechanism, we need to set the `text_id`
             # attribute directly. This causes the indexing to use this id.
@@ -266,6 +286,7 @@ class SrlReader(DatasetReader):
         fields: Dict[str, Field] = {}
         fields["tokens"] = text_field
         fields["verb_indicator"] = verb_indicator
+        fields["sentence_end"] = ArrayField(np.array(sep_index+1, dtype=np.int64), dtype=np.int64)
 
         if all(x == 0 for x in verb_label):
             verb = None
@@ -278,9 +299,35 @@ class SrlReader(DatasetReader):
         metadata_dict["verb"] = verb
         metadata_dict["verb_index"] = verb_index
 
+        if self._with_spans:
+            if tags:
+                new_tags = _convert_tags_to_wordpiece_tags(tags, offsets)
+                tag_index_dict = {}
+                cur_span_start = None
+                for i in range(len(new_tags)):
+                    if new_tags[i] != 'O':
+                        if new_tags[i][0] == 'B':
+                            if cur_span_start is not None:
+                                tag_index_dict[(cur_span_start, i-1)] = new_tags[i-1][2:]
+                            cur_span_start = i
+                    else:
+                        if cur_span_start is not None:
+                            tag_index_dict[(cur_span_start, i-1)] = new_tags[i-1][2:]
+                        cur_span_start = None
+            # print(tag_index_dict)
+            coref_instance = make_coref_instance([wordpieces], self._token_indexers, 30, span_label_map=tag_index_dict)
+            fields["tokens"] = coref_instance.fields["text"]
+            text_field = fields["tokens"]
+            fields["verb_indicator"] = SequenceLabelField(new_verbs, fields["tokens"])
+            fields["spans"] = coref_instance.fields["spans"]
+            fields["span_labels"] = coref_instance.fields["span_labels"]
+            # fields["span_mask"] = ArrayField(np.array([1 for _ in range(len(fields['spans'].field_list))], dtype=np.int64), dtype=np.int64)
+            # print([(span.span_start, span.span_end, label) for span, label in zip(fields['spans'].field_list, fields['span_labels'].labels) if label != "O"])
+
         if tags:
             if self.bert_tokenizer is not None:
                 new_tags = _convert_tags_to_wordpiece_tags(tags, offsets)
+                new_tags += ["O" for _ in range(len(wordpieces)-len(new_tags))]
                 fields["tags"] = SequenceLabelField(new_tags, text_field)
             else:
                 fields["tags"] = SequenceLabelField(tags, text_field)
