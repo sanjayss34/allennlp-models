@@ -1,15 +1,18 @@
 import logging
 from typing import Dict, List, Iterable, Tuple, Any
+import random
+from collections import defaultdict
 
 from overrides import overrides
-from transformers.tokenization_bert import BertTokenizer
+from transformers import AutoTokenizer, AutoConfig
+# from transformers.tokenization_bert import BertTokenizer
 import numpy as np
 
 from allennlp.common.file_utils import cached_path
 from allennlp.data.dataset_readers.dataset_reader import DatasetReader
 from allennlp.data.fields import Field, TextField, SequenceLabelField, MetadataField, ArrayField
 from allennlp.data.instance import Instance
-from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer
+from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer, PretrainedTransformerIndexer, PretrainedTransformerMismatchedIndexer
 from allennlp.data.tokenizers import Token, PretrainedTransformerTokenizer
 from allennlp_models.common.ontonotes import Ontonotes, OntonotesSentence
 
@@ -133,20 +136,35 @@ class SrlReader(DatasetReader):
         domain_identifier: str = None,
         bert_model_name: str = None,
         with_spans: bool = False,
+        mismatched_tokens: bool = False,
+        random_sample: bool = False,
+        random_seed: int = None,
         limit: int = -1,
+        print_violations: bool = False,
+        label_namespace: str = "labels",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self._token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer()}
+        self._token_indexers = token_indexers or {"tokens": PretrainedTransformerIndexer(model_name=bert_model_name)}
+        if mismatched_tokens:
+            self._token_indexers = {"tokens": PretrainedTransformerMismatchedIndexer(model_name=bert_model_name)}
+            self._dummy_indexer = {"dummy_tokens": SingleIdTokenIndexer()}
         self._domain_identifier = domain_identifier
         self._with_spans = with_spans
+        self._mismatched_tokens = mismatched_tokens
         self._limit = limit
+        self._random_sample = random_sample
+        self._random_seed = random_seed
+        self._max_sequence_length = 0
+        self._print_violations = print_violations
+        self._label_namespace = label_namespace
 
         if bert_model_name is not None:
-            self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+            self.bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
             if with_spans:
                 self.bert_tokenizer_allennlp = PretrainedTransformerTokenizer(model_name=bert_model_name)
             self.lowercase_input = "uncased" in bert_model_name
+            self.bert_config = AutoConfig.from_pretrained(bert_model_name)
         else:
             self.bert_tokenizer = None
             self.lowercase_input = False
@@ -194,13 +212,14 @@ class SrlReader(DatasetReader):
         for token in tokens:
             if self.lowercase_input:
                 token = token.lower()
-            word_pieces = self.bert_tokenizer.wordpiece_tokenizer.tokenize(token)
+            word_piece_ids = self.bert_tokenizer.encode_plus(token, add_special_tokens=False, return_tensors=None, return_offsets_mapping=False, return_attention_mask=False, return_token_type_ids=False)
+            word_pieces = self.bert_tokenizer.convert_ids_to_tokens(word_piece_ids['input_ids'])
             start_offsets.append(cumulative + 1)
             cumulative += len(word_pieces)
             end_offsets.append(cumulative)
             word_piece_tokens.extend(word_pieces)
 
-        wordpieces = [self.bert_tokenizer.cls_token] + word_piece_tokens + [self.bert_tokenizer.sep_token]
+        wordpieces = [self.bert_tokenizer.cls_token]+word_piece_tokens+[self.bert_tokenizer.sep_token]
 
         return wordpieces, end_offsets, start_offsets
 
@@ -217,26 +236,52 @@ class SrlReader(DatasetReader):
             )
 
         count = 0
+        instances = []
         for index, sentence in enumerate(self._ontonotes_subset(
             ontonotes_reader, file_path, self._domain_identifier
         )):
-            if self._limit > 0 and count >= self._limit:
+            if self._limit > 0 and count >= self._limit and not self._random_sample:
                 break
             tokens = [Token(t) for t in sentence.words]
             if not sentence.srl_frames:
                 # Sentence contains no predicates.
                 tags = ["O" for _ in tokens]
                 verb_label = [0 for _ in tokens]
-                continue
                 count += 1
-                yield self.text_to_instance(tokens, verb_label, tags)
+                instance = self.text_to_instance(tokens, verb_label, tags)
+                if self._random_sample and self._limit > 0:
+                    instances.append(instance)
+                else:
+                    yield instance
             else:
                 for (_, tags) in sentence.srl_frames:
-                    if self._limit > 0 and count >= self._limit:
+                    if self._limit > 0 and count >= self._limit and not self._random_sample:
                         break
                     count += 1
                     verb_indicator = [1 if label[-2:] == "-V" else 0 for label in tags]
-                    yield self.text_to_instance(tokens, verb_indicator, tags)
+                    if self._print_violations:
+                        violation = False
+                        counts = defaultdict(int)
+                        for t in tags:
+                            counts[t] += 1
+                        for key in list(counts.keys()):
+                            if key[:4] in {"B-R-", "B-C-"}:
+                                if counts["B-"+key[4:]] == 0:
+                                    violation = True
+                                    break
+                        if violation:
+                            logger.info(tokens)
+                            logger.info(tags)
+                    instance = self.text_to_instance(tokens, verb_indicator, tags)
+                    if self._random_sample and self._limit > 0:
+                        instances.append(instance)
+                    else:
+                        yield instance
+        if self._random_sample and self._limit > 0:
+            random.seed(self._random_seed)
+            sample = random.sample(instances, self._limit)
+            for instance in sample:
+                yield instance
 
     @staticmethod
     def _ontonotes_subset(
@@ -264,27 +309,38 @@ class SrlReader(DatasetReader):
             wordpieces, offsets, start_offsets = self._wordpiece_tokenize_input(
                 [t.text for t in tokens]
             )
+            self._max_sequence_length = max(self._max_sequence_length, len(wordpieces))
+            # print(self._max_sequence_length)
             new_verbs = _convert_verb_indices_to_wordpiece_indices(verb_label, offsets)
-            if not self._with_spans:
+            if not self._with_spans and not self._mismatched_tokens:
                 verb_tokens = [token for token, v in zip(wordpieces, new_verbs) if v == 1]
                 wordpieces += verb_tokens+[self.bert_tokenizer.sep_token]
                 new_verbs += [0 for _ in range(len(verb_tokens)+1)]
-            sep_index = wordpieces.index(self.bert_tokenizer.sep_token)
-            metadata_dict["offsets"] = start_offsets
             # In order to override the indexing mechanism, we need to set the `text_id`
             # attribute directly. This causes the indexing to use this id.
+            vocab = self.bert_tokenizer.get_vocab()
             text_field = TextField(
-                [Token(t, text_id=self.bert_tokenizer.vocab[t]) for t in wordpieces],
-                token_indexers=self._token_indexers,
+                [Token(t, text_id=vocab[t]) for t in wordpieces],
+                token_indexers={"tokens": self._token_indexers["tokens"]._matched_indexer}
             )
-            verb_indicator = SequenceLabelField(new_verbs, text_field)
+            if self._mismatched_tokens:
+                sep_index = len(tokens)+1
+                real_text_field = TextField(tokens, token_indexers=self._token_indexers)
+                if self.bert_config.type_vocab_size == 1:
+                    text_field = real_text_field
+                    new_verbs = verb_label
+            else:
+                sep_index = wordpieces.index(self.bert_tokenizer.sep_token)
+                real_text_field = text_field
+            metadata_dict["offsets"] = start_offsets
+            verb_indicator = SequenceLabelField(new_verbs, text_field, label_namespace=self._label_namespace)
 
         else:
             text_field = TextField(tokens, token_indexers=self._token_indexers)
             verb_indicator = SequenceLabelField(verb_label, text_field)
 
         fields: Dict[str, Field] = {}
-        fields["tokens"] = text_field
+        fields["tokens"] = real_text_field
         fields["verb_indicator"] = verb_indicator
         fields["sentence_end"] = ArrayField(np.array(sep_index+1, dtype=np.int64), dtype=np.int64)
 
@@ -326,9 +382,12 @@ class SrlReader(DatasetReader):
 
         if tags:
             if self.bert_tokenizer is not None:
-                new_tags = _convert_tags_to_wordpiece_tags(tags, offsets)
-                new_tags += ["O" for _ in range(len(wordpieces)-len(new_tags))]
-                fields["tags"] = SequenceLabelField(new_tags, text_field)
+                if not self._mismatched_tokens:
+                    new_tags = _convert_tags_to_wordpiece_tags(tags, offsets)
+                    new_tags += ["O" for _ in range(len(wordpieces)-len(new_tags))]
+                else:
+                    new_tags = tags
+                fields["tags"] = SequenceLabelField(new_tags, real_text_field, label_namespace=self._label_namespace)
             else:
                 fields["tags"] = SequenceLabelField(tags, text_field)
             metadata_dict["gold_tags"] = tags
