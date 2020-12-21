@@ -19,8 +19,10 @@ class ConllCorefScores(Metric):
         self,  # type: ignore
         top_spans: torch.Tensor,
         antecedent_indices: torch.Tensor,
-        predicted_antecedents: torch.Tensor,
         metadata_list: List[Dict[str, Any]],
+        predicted_antecedents: torch.Tensor = None,
+        predicted_clusters_list: List[List[Tuple[Tuple[int, int]]]] = None,
+        mention_to_predicted_list: List[Dict[Tuple[int, int], Tuple[Tuple[int, int]]]] = None,
     ):
         """
         # Parameters
@@ -50,9 +52,13 @@ class ConllCorefScores(Metric):
 
         for i, metadata in enumerate(metadata_list):
             gold_clusters, mention_to_gold = self.get_gold_clusters(metadata["clusters"])
-            predicted_clusters, mention_to_predicted = self.get_predicted_clusters(
-                top_spans[i], antecedent_indices[i], predicted_antecedents[i]
-            )
+            if predicted_clusters_list is not None:
+                predicted_clusters = predicted_clusters_list[i]
+                mention_to_predicted = mention_to_predicted_list[i]
+            else:
+                predicted_clusters, mention_to_predicted = self.get_predicted_clusters(
+                    top_spans[i], antecedent_indices[i], predicted_antecedents[i]
+                )
             for scorer in self.scorers:
                 scorer.update(
                     predicted_clusters, gold_clusters, mention_to_predicted, mention_to_gold

@@ -11,6 +11,8 @@ from allennlp.data.fields import ListField, SequenceLabelField
 from allennlp.models import Model
 from allennlp.predictors.predictor import Predictor
 
+from allennlp_models.coref.tase_utils import split_tokens_by_hyphen, custom_word_tokenizer
+
 
 @Predictor.register("coreference_resolution")
 class CorefPredictor(Predictor):
@@ -28,8 +30,10 @@ class CorefPredictor(Predictor):
         # We have to use spacy to tokenise our document here, because we need
         # to also know sentence boundaries to propose valid mentions.
         self._spacy = get_spacy_model(language, pos_tags=True, parse=True, ner=False)
+        self._word_tokenizer = custom_word_tokenizer()
+        self._word_tokenize = lambda text: [token for token in split_tokens_by_hyphen(self._word_tokenizer.tokenize(text))]
 
-    def predict(self, document: str) -> JsonDict:
+    def predict(self, document: str, document_words: List[str] = None) -> JsonDict:
         """
         Predict the coreference clusters in the given document.
 
@@ -61,7 +65,10 @@ class CorefPredictor(Predictor):
 
         A dictionary representation of the predicted coreference clusters.
         """
-        return self.predict_json({"document": document})
+        dict_info = {"document": document}
+        if document_words is not None:
+            dict_info["document_words"] = document_words
+        return self.predict_json(dict_info)
 
     def predict_tokenized(self, tokenized_document: List[str]) -> JsonDict:
         """
@@ -201,5 +208,9 @@ class CorefPredictor(Predictor):
         document = json_dict["document"]
         spacy_document = self._spacy(document)
         sentences = [[token.text for token in sentence] for sentence in spacy_document.sents]
-        instance = self._dataset_reader.text_to_instance(sentences)
+        if "document_words" in json_dict:
+            words = json_dict["document_words"]
+        else:
+            words = None
+        instance = self._dataset_reader.text_to_instance(sentences, words=words)
         return instance

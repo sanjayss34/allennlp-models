@@ -1,6 +1,7 @@
 import logging
 import collections
 from typing import Dict, List, Optional, Tuple, DefaultDict
+import os
 
 from overrides import overrides
 
@@ -60,6 +61,9 @@ class ConllCorefReader(DatasetReader):
         wordpiece_modeling_tokenizer: Optional[PretrainedTransformerTokenizer] = None,
         max_sentences: int = None,
         remove_singleton_clusters: bool = False,
+        test_run: bool = False,
+        pickle_path: str = None,
+        srl: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -68,40 +72,100 @@ class ConllCorefReader(DatasetReader):
         self._wordpiece_modeling_tokenizer = wordpiece_modeling_tokenizer
         self._max_sentences = max_sentences
         self._remove_singleton_clusters = remove_singleton_clusters
+        self._test_run = test_run
+        self._pickle_path = pickle_path
+        self._srl = srl
 
     @overrides
     def _read(self, file_path: str):
-        # if `file_path` is a URL, redirect to the cache
-        file_path = cached_path(file_path)
+        read_from_pickle = False
+        if self._pickle_path is not None:
+            if os.path.exists(self._pickle_path):
+                read_from_pickle = True
+                f = open(self._pickle_path, 'rb')
+                instances = pickle.load(f)
+                f.close()
+                for instance in instances:
+                    yield instance
+        if not read_from_pickle:
+            # if `file_path` is a URL, redirect to the cache
+            file_path = cached_path(file_path)
 
-        ontonotes_reader = Ontonotes()
-        for sentences in ontonotes_reader.dataset_document_iterator(file_path):
-            clusters: DefaultDict[int, List[Tuple[int, int]]] = collections.defaultdict(list)
+            ontonotes_reader = Ontonotes()
+            instances = []
+            for sentences in ontonotes_reader.dataset_document_iterator(file_path):
+                clusters: DefaultDict[int, List[Tuple[int, int]]] = collections.defaultdict(list)
+                srl_frames = []
 
-            total_tokens = 0
-            for sentence in sentences:
-                for typed_span in sentence.coref_spans:
-                    # Coref annotations are on a _per sentence_
-                    # basis, so we need to adjust them to be relative
-                    # to the length of the document.
-                    span_id, (start, end) = typed_span
-                    clusters[span_id].append((start + total_tokens, end + total_tokens))
-                total_tokens += len(sentence.words)
+                total_tokens = 0
+                for sentence in sentences:
+                    for typed_span in sentence.coref_spans:
+                        # Coref annotations are on a _per sentence_
+                        # basis, so we need to adjust them to be relative
+                        # to the length of the document.
+                        span_id, (start, end) = typed_span
+                        clusters[span_id].append((start + total_tokens, end + total_tokens))
+                    for _, srl_tags in sentence.srl_frames:
+                        predicate_index = None
+                        for i in range(len(srl_tags)):
+                            if srl_tags[i][-2:] == "-V":
+                                predicate_index = i
+                                break
+                        if predicate_index is None:
+                            print(srl_tags)
+                            continue
+                        # assert predicate_index is not None
+                        predicate_index += total_tokens
+                        current = None
+                        current_type = None
+                        arguments = []
+                        argument_types = []
+                        for i in range(len(srl_tags)):
+                            if srl_tags[i] == "O" and current is not None:
+                                arguments.append((current, i-1))
+                                argument_types.append(current_type)
+                                current = None
+                                current_type = None
+                            elif srl_tags[i][:2] == "B-":
+                                if current is not None:
+                                    arguments.append((current, i-1))
+                                    argument_types.append(current_type)
+                                current = i
+                                current_type = srl_tags[i][2:]
+                        if current is not None:
+                            arguments.append((current, len(srl_tags)-1))
+                            argument_types.append(current_type)
+                        arguments = [(start+total_tokens, end+total_tokens, arg_type) for (start, end), arg_type in zip(arguments, argument_types)]
+                        srl_frames.append((predicate_index, arguments))
+                    total_tokens += len(sentence.words)
 
-            yield self.text_to_instance([s.words for s in sentences], list(clusters.values()))
+                instance = self.text_to_instance(sentences=[s.words for s in sentences], gold_clusters=list(clusters.values()), srl_frames=srl_frames)
+                instances.append(instance)
+                yield instance
+                if self._test_run:
+                    break
+            if not self._test_run and self._pickle_path is not None:
+                f = open(self._pickle_path, 'wb')
+                pickle.dump(instances, f)
+                f.close()
 
     @overrides
     def text_to_instance(
         self,  # type: ignore
         sentences: List[List[str]],
+        words: Optional[List[str]] = None,
         gold_clusters: Optional[List[List[Tuple[int, int]]]] = None,
+        srl_frames: Optional[List[Tuple[int, List[Tuple[int, int, str]]]]] = None,
     ) -> Instance:
         return make_coref_instance(
             sentences,
             self._token_indexers,
             self._max_span_width,
-            gold_clusters,
-            self._wordpiece_modeling_tokenizer,
-            self._max_sentences,
-            self._remove_singleton_clusters,
+            words=words,
+            gold_clusters=gold_clusters,
+            srl_frames=srl_frames,
+            include_srl=self._srl,
+            wordpiece_modeling_tokenizer=self._wordpiece_modeling_tokenizer,
+            max_sentences=self._max_sentences,
+            remove_singleton_clusters=self._remove_singleton_clusters,
         )

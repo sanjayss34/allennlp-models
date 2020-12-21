@@ -1,10 +1,13 @@
 from typing import Any, Dict, List, Optional, Tuple, Set, Union
 
+import numpy as np
+
 from allennlp.data.fields import (
     Field,
     ListField,
     TextField,
     SpanField,
+    ArrayField,
     MetadataField,
     SequenceLabelField,
 )
@@ -13,12 +16,16 @@ from allennlp.data.tokenizers import Token, PretrainedTransformerTokenizer
 from allennlp.data.token_indexers import TokenIndexer
 from allennlp.data.dataset_readers.dataset_utils import enumerate_spans
 
+from allennlp_models.coref.asymmetric_adjacency_field import AsymmetricAdjacencyField
 
 def make_coref_instance(
     sentences: List[List[str]],
     token_indexers: Dict[str, TokenIndexer],
     max_span_width: int,
+    words: List[str] = None,
     gold_clusters: Optional[List[List[Tuple[int, int]]]] = None,
+    srl_frames: Optional[List[Tuple[int, List[Tuple[int, int, str]]]]] = None,
+    include_srl: bool = False,
     wordpiece_modeling_tokenizer: PretrainedTransformerTokenizer = None,
     max_sentences: int = None,
     remove_singleton_clusters: bool = True,
@@ -84,6 +91,8 @@ def make_coref_instance(
             gold_clusters = new_gold_clusters
 
     flattened_sentences = [_normalize_word(word) for sentence in sentences for word in sentence]
+    if words is not None:
+        flattened_sentences = [_normalize_word(word) for word in words]
 
     if wordpiece_modeling_tokenizer is not None:
         flat_sentences_tokens, offsets = wordpiece_modeling_tokenizer.intra_word_tokenize(
@@ -113,9 +122,13 @@ def make_coref_instance(
                 cluster_dict[tuple(mention)] = cluster_id
 
     spans: List[Field] = []
-    span_labels: Optional[List[Union[int,str]]] = [] # if gold_clusters is not None else None
+    span_index_map: Dict[Tuple[int, int], int] = {}
+    span_sentence_map: Dict[Tuple[int, int], int] = {}
+    token_sentence_map: Dict[Tuple[int, int], int] = {}
+    span_labels: Optional[List[Union[int,str]]] = [] if gold_clusters is not None else None
 
     sentence_offset = 0
+    sentence_offsets = []
     for sent_index, sentence in enumerate(sentences):
         for start, end in enumerate_spans(
             sentence, offset=sentence_offset, max_span_width=max_span_width
@@ -150,12 +163,19 @@ def make_coref_instance(
                 else:
                     span_labels[-1] = "O"
 
-            spans.append(SpanField(start, end, text_field))
+            if end <= len(flat_sentences_tokens)-1:
+                span = (start, end)
+                span_index_map[span] = len(spans)
+                span_sentence_map[span] = sent_index
+                spans.append(SpanField(start, end, text_field))
+        for i in range(len(sentence)):
+            token_sentence_map[i+sentence_offset] = sent_index
+        sentence_offsets.append(sentence_offset)
         sentence_offset += len(sentence)
 
     span_field = ListField(spans)
 
-    metadata: Dict[str, Any] = {"original_text": flattened_sentences}
+    metadata: Dict[str, Any] = {"original_text": flattened_sentences, "sentence_offsets": sentence_offsets}
     if gold_clusters is not None:
         metadata["clusters"] = gold_clusters
     metadata_field = MetadataField(metadata)
@@ -167,6 +187,22 @@ def make_coref_instance(
     }
     if span_labels is not None:
         fields["span_labels"] = SequenceLabelField(span_labels, span_field, label_namespace="span_labels")
+    if include_srl and srl_frames is not None:
+        predicate_span_pairs = []
+        pair_labels = []
+        for predicate_index, arguments in srl_frames:
+            for (start, end, arg_type) in arguments:
+                if (start, end) in span_index_map:
+                    predicate_span_pairs.append((predicate_index, span_index_map[(start, end)]))
+                    pair_labels.append(arg_type)
+        fields["srl_labels"] = AsymmetricAdjacencyField(predicate_span_pairs, text_field, span_field, labels=pair_labels, label_namespace="srl_labels")
+        metadata["srl_frames"] = srl_frames
+        word_span_mask = np.zeros((len(flat_sentences_tokens), len(spans)), dtype=np.int32)
+        for token in range(len(flat_sentences_tokens)):
+            for span in span_sentence_map:
+                if token_sentence_map[token] == span_sentence_map[span]:
+                    word_span_mask[token, span_index_map[span]] = 1
+        fields["word_span_mask"] = ArrayField(word_span_mask, dtype=np.int32)
 
     return Instance(fields)
 
