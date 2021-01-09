@@ -1,6 +1,8 @@
 import logging
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, cast
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import torch
 import torch.nn.functional as F
@@ -9,14 +11,17 @@ from overrides import overrides
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
-from allennlp.modules import FeedForward, GatedSum
+from allennlp.modules import FeedForward, GatedSum, ConditionalRandomField
+from allennlp.modules.conditional_random_field import allowed_transitions
 from allennlp.modules import Seq2SeqEncoder, TimeDistributed, TextFieldEmbedder
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor, EndpointSpanExtractor
 from allennlp.nn import util, InitializerApplicator
+from allennlp.training.metrics import SpanBasedF1Measure, FBetaMeasure
 
 from allennlp_models.coref.metrics.conll_coref_scores import ConllCorefScores
 from allennlp_models.coref.metrics.mention_recall import MentionRecall
 from allennlp_models.structured_prediction.metrics.e2e_srl_metric import E2eSrlMetric
+from allennlp_models.structured_prediction.metrics.srl_eval_scorer import SrlEvalScorer
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +93,12 @@ class CoreferenceResolver(Model):
         srl_scorer: FeedForward = None,
         srl_predicate_scorer: FeedForward = None,
         srl_dropout: float = 0.1,
+        srl_e2e: bool = True,
+        predict_ner: bool = False,
+        ner_sequence: bool = True,
+        ner_scorer: FeedForward = None,
+        language_masking_map: Dict[str, bool] = None,
+        load_weights_path: str = None,
         initializer: InitializerApplicator = InitializerApplicator(),
         **kwargs
     ) -> None:
@@ -114,9 +125,11 @@ class CoreferenceResolver(Model):
         self._attentive_span_extractor = SelfAttentiveSpanExtractor(
             input_dim=text_field_embedder.get_output_dim()
         )
+        self._language_masking_map = language_masking_map
 
         self._predict_srl = predict_srl
         self._predict_coref = predict_coref
+        self._predict_ner = predict_ner
         if predict_srl:
             if srl_predicate_feedforward is not None:
                 self._srl_predicate_feedforward = TimeDistributed(srl_predicate_feedforward)
@@ -126,6 +139,10 @@ class CoreferenceResolver(Model):
                 self._srl_argument_feedforward = TimeDistributed(srl_argument_feedforward)
             else:
                 self._srl_argument_feedforward = lambda x: x
+            if srl_e2e:
+                label_namespace = "srl_labels"
+            else:
+                label_namespace = "srl_seq_labels"
             if srl_scorer is None:
                 self._srl_scorer = TimeDistributed(
                     torch.nn.Linear(context_layer.get_output_dim()+mention_feedforward.get_input_dim(), self.vocab.get_vocab_size(namespace="srl_labels"))
@@ -133,7 +150,7 @@ class CoreferenceResolver(Model):
             else:
                 srl_scorer = torch.nn.Sequential(
                     srl_scorer,
-                    torch.nn.Linear(srl_scorer.get_output_dim(), self.vocab.get_vocab_size(namespace="srl_labels")),
+                    torch.nn.Linear(srl_scorer.get_output_dim(), self.vocab.get_vocab_size(namespace=label_namespace)),
                 )
                 self._srl_scorer = TimeDistributed(srl_scorer)
             if srl_predicate_scorer is None:
@@ -144,7 +161,36 @@ class CoreferenceResolver(Model):
                 self._srl_predicate_scorer = TimeDistributed(srl_predicate_scorer)
             self._srl_dropout = torch.nn.Dropout(p=srl_dropout)
             self._predicate_candidates_per_word = srl_predicate_candidates_per_word
-            self._srl_metric = E2eSrlMetric()
+            self._srl_e2e = srl_e2e
+            if srl_e2e:
+                self._srl_metric = E2eSrlMetric()
+            else:
+                self._srl_metric = SrlEvalScorer(ignore_classes=["V"])
+                label_encoding = "BIO"
+                labels = self.vocab.get_index_to_token_vocabulary(label_namespace)
+                constraints = allowed_transitions(label_encoding, labels)
+                self.srl_crf = ConditionalRandomField(
+                    self.vocab.get_vocab_size(label_namespace), constraints, include_start_end_transitions=True
+                )
+        self._ner_sequence = ner_sequence
+        if predict_ner:
+            if ner_sequence:
+                label_encoding = "BIO"
+                label_namespace = "ner_seq_labels"
+                self._ner_metric = SpanBasedF1Measure(vocab, tag_namespace=label_namespace, label_encoding=label_encoding)
+                labels = self.vocab.get_index_to_token_vocabulary(label_namespace)
+                constraints = allowed_transitions(label_encoding, labels)
+                self.ner_crf = ConditionalRandomField(
+                    self.vocab.get_vocab_size(label_namespace), constraints, include_start_end_transitions=True
+                )
+            else:
+                label_namespace = "ner_span_labels"
+                self._ner_metric = FBetaMeasure(average="macro")
+            self._ner_scorer = torch.nn.Sequential(
+                ner_scorer,
+                torch.nn.Linear(ner_scorer.get_output_dim(), self.vocab.get_vocab_size(namespace=label_namespace)),
+            )
+            self._ner_scorer = TimeDistributed(self._ner_scorer)
 
         # 10 possible distance buckets.
         self._num_distance_buckets = 10
@@ -172,6 +218,9 @@ class CoreferenceResolver(Model):
         else:
             self._lexical_dropout = lambda x: x
         initializer(self)
+        if load_weights_path is not None:
+            state = torch.load(load_weights_path)
+            self.load_state_dict(state)
 
     @overrides
     def forward(
@@ -180,6 +229,11 @@ class CoreferenceResolver(Model):
         spans: torch.IntTensor,
         span_labels: torch.IntTensor = None,
         srl_labels: torch.LongTensor = None,
+        srl_seq_labels: torch.LongTensor = None,
+        srl_seq_indices: torch.LongTensor = None,
+        srl_seq_predicates: torch.LongTensor = None,
+        ner_seq_labels: torch.LongTensor = None,
+        ner_span_labels: torch.LongTensor = None,
         word_span_mask: torch.IntTensor = None,
         metadata: List[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -219,6 +273,13 @@ class CoreferenceResolver(Model):
         loss : `torch.FloatTensor`, optional
             A scalar loss to be optimised.
         """
+        if metadata is not None and "language" in metadata[0] and self._language_masking_map is not None and self._language_masking_map[metadata[0]["language"]]:
+            key = self._text_field_embedder._ordered_embedder_keys[0]
+            input_tensors = text[key]
+            embedder = getattr(self._text_field_embedder, "token_embedder_"+key)
+            _, loss = embedder(**input_tensors, masked_lm=[self._language_masking_map[metadata[i]["language"]] for i in range(len(metadata))])
+            outputs = {"loss": loss}
+            return outputs
         # Shape: (batch_size, document_length, embedding_size)
         text_embeddings = self._lexical_dropout(self._text_field_embedder(text))
 
@@ -255,9 +316,11 @@ class CoreferenceResolver(Model):
         num_spans_to_keep = int(math.floor(self._spans_per_word * document_length))
         num_spans_to_keep = min(num_spans_to_keep, num_spans)
 
+        transformed_span_embeddings = self._mention_feedforward(span_embeddings)
+
         # Shape: (batch_size, num_spans)
         span_mention_scores = self._mention_scorer(
-            self._mention_feedforward(span_embeddings)
+            transformed_span_embeddings
         ).squeeze(-1)
         # Shape: (batch_size, num_spans) for all 3 tensors
         top_span_mention_scores, top_span_mask, top_span_indices = util.masked_topk(
@@ -281,11 +344,15 @@ class CoreferenceResolver(Model):
         )
 
         output_dict = {
-            "top_spans": top_spans
+            "top_spans": top_spans,
+            "all_spans": spans
         }
-        loss = 0.0
+        loss = torch.tensor(0.0)
 
-        if self._predict_srl:
+        if self._predict_srl and self._srl_e2e:
+            word_span_mask = word_span_mask.to_dense()
+            if srl_labels is not None:
+                srl_labels = srl_labels.to_dense()
             # Shape: (batch_size, document_length)
             predicate_candidate_scores = self._srl_predicate_scorer(contextualized_embeddings).view(batch_size, document_length)
             num_predicate_candidates_to_keep = int(math.floor(self._predicate_candidates_per_word * document_length))
@@ -314,18 +381,21 @@ class CoreferenceResolver(Model):
                 max_arg_span_candidates
             )
             # Shape: (batch_size * num_predicate_candidates_to_keep * max_arg_span_candidates)
-            flat_top_argument_indices = util.flatten_and_batch_shift_indices(top_argument_indices, max_arg_span_candidates)
+            flat_top_argument_indices = util.flatten_and_batch_shift_indices(top_argument_indices, num_spans_to_keep)
 
             # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates, 2) for all 3 tensors
+            # print(top_argument_indices.min(), top_argument_indices.max(), flat_top_argument_indices.min(), flat_top_argument_indices.max(), num_predicate_candidates_to_keep, num_spans_to_keep, max_arg_span_candidates, top_spans.shape, top_argument_indices.shape)
             top_argument_spans = util.batched_index_select(
-                top_spans,
+                top_spans.unsqueeze(1).repeat(1, num_predicate_candidates_to_keep, 1, 1).view(batch_size*num_predicate_candidates_to_keep, num_spans_to_keep, 2),
                 top_argument_indices,
                 flat_top_argument_indices
             ).view(batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates, 2)
 
             # Shape: (batch_size * num_predicate_candidates_to_keep, max_arg_span_candidates, embedding_size)
             top_argument_embeddings = util.batched_index_select(
-                top_span_embeddings, top_argument_indices, flat_top_argument_indices
+                top_span_embeddings.unsqueeze(1).repeat(1, num_predicate_candidates_to_keep, 1, 1).view(batch_size*num_predicate_candidates_to_keep, num_spans_to_keep, -1),
+                top_argument_indices,
+                flat_top_argument_indices
             ).view(batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates, -1)
 
             # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates) for all 3 tensors
@@ -337,40 +407,133 @@ class CoreferenceResolver(Model):
 
             # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates)
             word_span_mask = torch.gather(word_span_mask, 2, top_argument_indices)
+            if srl_labels is not None:
+                original_srl_labels = srl_labels.clone()
+                # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates)
+                srl_labels = torch.gather(srl_labels, 2, top_span_indices.unsqueeze(1).repeat(1, srl_labels.shape[1], 1))
+                srl_labels = torch.gather(srl_labels, 1, top_predicate_indices.unsqueeze(-1).repeat(1, 1, srl_labels.shape[-1]))
+                srl_labels = torch.gather(srl_labels, 2, top_argument_indices)
 
             # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates, embedding_size)
             top_predicate_candidate_embeddings = top_predicate_candidate_embeddings.unsqueeze(2).repeat(1, 1, max_arg_span_candidates, 1)
             predicate_argument_embeddings = torch.cat((top_predicate_candidate_embeddings, top_argument_embeddings), dim=-1)
             # Shape: (batch_size, num_predicate_candidates_to_keep, max_arg_span_candidates, num_labels)
-            print(predicate_argument_embeddings.shape, num_predicate_candidates_to_keep, num_spans_to_keep, self.vocab.get_vocab_size(namespace="srl_labels"))
+            # print(predicate_argument_embeddings.shape, num_predicate_candidates_to_keep, num_spans_to_keep, self.vocab.get_vocab_size(namespace="srl_labels"))
             predicate_argument_scores = self._srl_scorer(predicate_argument_embeddings)+top_predicate_scores.unsqueeze(-1).unsqueeze(-1)+top_argument_scores.unsqueeze(-1)
-            predicate_argument_scores = torch.cat((torch.zeros_like(predicate_argument_scores[:,:,:,:1]), predicate_argument_scores), dim=-1)
             # Set predicate-argument pair score to very negative value when the two are not in the same sentence
             predicate_argument_scores = torch.where(word_span_mask.unsqueeze(-1) > 0, predicate_argument_scores, -10000.*torch.ones_like(predicate_argument_scores))
-            predicted_tags = []
-            if not self.training:
-                for b in range(batch_size):
-                    predicted_tags.append([])
-                    for i in range(num_predicate_candidates_to_keep):
-                        for j in range(num_spans_to_keep):
-                            if predicate_argument_scores[b,i,j,:].argmax().item() > 0:
-                                predicted_tags[-1].append((top_predicate_indices[b,i].item(), (top_spans[b,j,0].item(), top_spans[b,j,1].item(), self.vocab.get_token_from_index(predicate_argument_scores[b,i,j,:].argmax().item()-1, namespace="srl_labels"))))
-                output_dict["srl_predictions"] = predicted_tags
+            predicate_argument_scores = torch.cat((torch.zeros_like(predicate_argument_scores[:,:,:,:1]), predicate_argument_scores), dim=-1)
+            predicted_tags = [[] for _ in range(batch_size)]
+            predicted_indices = predicate_argument_scores.argmax(-1).nonzero()
+            for i in range(predicted_indices.shape[0]):
+                batch_index, predicate_index, span_index = predicted_indices[i,:].tolist()
+                predicted_tags[batch_index].append((top_predicate_indices[batch_index,predicate_index].item(), (top_argument_spans[batch_index,predicate_index,span_index,0].item(), top_argument_spans[batch_index,predicate_index,span_index,1].item(), self.vocab.get_token_from_index(predicate_argument_scores[batch_index,predicate_index,span_index,:].argmax().item()-1, namespace="srl_labels"))))
+            output_dict["srl_predictions"] = predicted_tags
 
             if srl_labels is not None:
-                # Shape: (batch_size, num_predicate_candidates_to_keep, num_spans_to_keep)
-                srl_labels = torch.gather(srl_labels, 2, top_span_indices.unsqueeze(1).repeat(1, srl_labels.shape[1], 1))
-                srl_labels = torch.gather(srl_labels, 1, top_predicate_indices.unsqueeze(-1).repeat(1, 1, srl_labels.shape[-1]))
-                srl_labels = torch.gather(srl_labels, 2, top_argument_indices)
-                print(predicate_argument_scores.shape, srl_labels.shape)
-                loss += torch.nn.CrossEntropyLoss()(predicate_argument_scores.view(-1, predicate_argument_scores.shape[-1]), srl_labels.view(-1)+1)
+                loss += torch.nn.CrossEntropyLoss()(predicate_argument_scores.view(-1, predicate_argument_scores.shape[-1]), srl_labels.view(-1)) # *num_spans_to_keep/num_predicate_candidates_to_keep
                 gold_srl_triples = []
                 for i in range(batch_size):
+                    gold_srl_triples.append([])
                     for predicate_index, arguments in metadata[i]["srl_frames"]:
                         for span in arguments:
-                            gold_srl_triples.append((predicate_index, span))
+                            gold_srl_triples[-1].append((predicate_index, span))
+                self._srl_metric(predicted_tags, gold_srl_triples)
+        elif self._predict_srl and srl_seq_predicates is not None:
+            # Shape: (batch_size, num_predicates)
+            predicate_mask = (srl_seq_predicates > -1).bool()
+            # Shape: (batch_size, num_predicates, embedding_size)
+            predicate_embeddings = torch.gather(contextualized_embeddings, 1, srl_seq_predicates.unsqueeze(-1).repeat(1, 1, contextualized_embeddings.shape[-1]).clamp(min=0))
+            # Shape: (batch_size, num_predicates, sentence_length)
+            sequence_mask = (srl_seq_indices > -1).long()
+            _, num_predicates, sentence_length = sequence_mask.shape
+            # Shape: (batch_size, num_predicates*sentence_length, embedding_size)
+            seq_embeddings = torch.gather(contextualized_embeddings, 1, srl_seq_indices.view(batch_size, -1).unsqueeze(-1).repeat(1, 1, contextualized_embeddings.shape[-1]).clamp(min=0))
+            # Shape: (batch_size, num_predicates, sentence_length, embedding_size)
+            seq_embeddings = seq_embeddings.view(batch_size, num_predicates, sentence_length, seq_embeddings.shape[2])
+            # Shape: (batch_size, num_predicates, sentence_length, 2*embedding_size)
+            classifier_inputs = torch.cat((seq_embeddings, predicate_embeddings.unsqueeze(2).repeat(1, 1, sentence_length, 1)), dim=-1)
+            # Shape: (batch_size, num_predicates, sentence_length, num_labels)
+            classifier_outputs = self._srl_scorer(classifier_inputs)
+            class_probabilities = torch.softmax(classifier_outputs, dim=-1)
+            if not self.training:
+                viterbi_output = self.srl_crf.viterbi_tags(
+                    classifier_outputs.view(-1, sentence_length, classifier_outputs.shape[-1])[predicate_mask.view(-1),:,:],
+                    sequence_mask.view(-1, sentence_length)[predicate_mask.view(-1),:]
+                )
+                bio_predicted_tags = [
+                    [self.vocab.get_token_from_index(tag, namespace="srl_seq_labels") for tag in seq] for (seq, _) in viterbi_output
+                ]
+            if srl_seq_labels is not None:
+                loss += -self.srl_crf(classifier_outputs.view(-1, sentence_length, classifier_outputs.shape[3]), srl_seq_labels.view(-1, sentence_length), sequence_mask.view(-1, sentence_length))/sequence_mask.sum().float()
                 if not self.training:
-                    self._srl_metric(predicted_tags, gold_srl_triples)
+                    from allennlp_models.structured_prediction.models.srl import (
+                        convert_bio_tags_to_conll_format,
+                    )
+
+                    batch_conll_predicted_tags = [
+                        convert_bio_tags_to_conll_format(seq) for seq in bio_predicted_tags
+                    ]
+                    batch_bio_gold_tags = [
+                        seq for example_metadata in metadata for seq in example_metadata["srl_seq_labels"]
+                    ]
+                    # print(batch_bio_gold_tags)
+                    batch_conll_gold_tags = [
+                        convert_bio_tags_to_conll_format(tags) for tags in batch_bio_gold_tags
+                    ]
+                    batch_sentences = [
+                        words for example_metadata in metadata for words in example_metadata["srl_seq_words"]
+                    ]
+                    sentence_offsets = srl_seq_indices[:,:,0]
+                    batch_predicate_indices_minus_offset = (srl_seq_predicates-sentence_offsets).view(-1)[predicate_mask.view(-1)].tolist()
+                    """for lst1, lst2, bio_gold, sent, pred in zip(batch_conll_predicted_tags, batch_conll_gold_tags, batch_bio_gold_tags, batch_sentences, batch_predicate_indices_minus_offset):
+                        print('A', lst1)
+                        print('B', lst2)
+                        print('C', bio_gold)
+                        self._srl_metric(
+                            [pred],
+                            [sent],
+                            [lst1],
+                            [lst2]
+                        )"""
+                    self._srl_metric(
+                        batch_predicate_indices_minus_offset,
+                        batch_sentences,
+                        batch_conll_predicted_tags,
+                        batch_conll_gold_tags,
+                    )
+
+        if self._predict_ner and self._ner_sequence:
+            classifier_outputs = self._ner_scorer(contextualized_embeddings)
+            if ner_seq_labels is not None:
+                loss += -self.ner_crf(classifier_outputs, ner_seq_labels, text_mask)/text_mask.sum().float()
+                if not self.training:
+                    viterbi_output = self.ner_crf.viterbi_tags(
+                        classifier_outputs,
+                        text_mask,
+                        top_k=1
+                    )
+                    predicted_tags = cast(List[List[int]], [x[0][0] for x in viterbi_output])
+                    # Represent viterbi tags as "class probabilities" that we can
+                    # feed into the metrics
+                    class_probabilities = classifier_outputs * 0.0
+                    for i, instance_tags in enumerate(predicted_tags):
+                        for j, tag_id in enumerate(instance_tags):
+                            class_probabilities[i, j, tag_id] = 1
+                    self._ner_metric(class_probabilities, ner_seq_labels, text_mask)
+                    predicted_string_tags = [[self.vocab.get_token_from_index(i, namespace="ner_seq_labels") for i in lst] for lst in predicted_tags]
+                    output_dict["ner_predictions"] = predicted_string_tags
+                    if metadata is not None:
+                        output_dict["ner_seq_labels"] = [x["ner_seq_labels"] for x in metadata]
+        elif self._predict_ner:
+            span_entity_scores = self._ner_scorer(transformed_span_embeddings).view(-1, self.vocab.get_vocab_size("ner_span_labels"))
+            if ner_span_labels is not None:
+                ner_span_labels = ner_span_labels.view(-1)
+                loss += torch.nn.CrossEntropyLoss()(span_entity_scores, ner_span_labels)
+                self._ner_metric(span_entity_scores, ner_span_labels)
+                if metadata is not None:
+                    output_dict["ner_seq_labels"] = [x["ner_seq_labels"] for x in metadata]
+            output_dict["ner_predictions"] = [[self.vocab.get_token_from_index(span_entity_scores[i*span_entity_scores.shape[1]+j,:].argmax().item(), namespace="ner_span_labels") for j in range(num_spans)] for i in range(batch_size)]
 
         if self._predict_coref:
             # Compute indices for antecedent spans to consider.
@@ -502,18 +665,69 @@ class CoreferenceResolver(Model):
                     coreference_scores, top_span_mask.unsqueeze(-1)
                 )
                 correct_antecedent_log_probs = coreference_log_probs + gold_antecedent_labels.log()
-                negative_marginal_log_likelihood = -util.logsumexp(correct_antecedent_log_probs).sum()
+                negative_marginal_log_likelihood = -util.logsumexp(correct_antecedent_log_probs).mean()
 
                 self._mention_recall(top_spans, metadata)
                 self._conll_coref_scores(
-                    top_spans, top_antecedent_indices, predicted_antecedents, metadata
+                    top_spans, top_antecedent_indices, metadata, predicted_antecedents
                 )
                 loss += negative_marginal_log_likelihood
+                output_dict["gold_clusters"] = [x["clusters"] for x in metadata]
 
         output_dict["loss"] = loss
 
         if metadata is not None:
             output_dict["document"] = [x["original_text"] for x in metadata]
+        return output_dict
+
+    def srl_seq_make_output_human_readable(
+        self, output_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Does constrained viterbi decoding on class probabilities output in :func:`forward`.  The
+        constraint simply specifies that the output tags must be a valid BIO sequence.  We add a
+        `"tags"` key to the dictionary with the result.
+
+        NOTE: First, we decode a BIO sequence on top of the wordpieces. This is important; viterbi
+        decoding produces low quality output if you decode on top of word representations directly,
+        because the model gets confused by the 'missing' positions (which is sensible as it is trained
+        to perform tagging on wordpieces, not words).
+
+        Secondly, it's important that the indices we use to recover words from the wordpieces are the
+        start_offsets (i.e offsets which correspond to using the first wordpiece of words which are
+        tokenized into multiple wordpieces) as otherwise, we might get an ill-formed BIO sequence
+        when we select out the word tags from the wordpiece tags. This happens in the case that a word
+        is split into multiple word pieces, and then we take the last tag of the word, which might
+        correspond to, e.g, I-V, which would not be allowed as it is not preceeded by a B tag.
+        """
+        all_predictions = output_dict["class_probabilities"]
+        sequence_lengths = get_lengths_from_binary_sequence_mask(output_dict["mask"]).data.tolist()
+
+        if all_predictions.dim() == 3:
+            predictions_list = [
+                all_predictions[i].detach().cpu() for i in range(all_predictions.size(0))
+            ]
+        else:
+            predictions_list = [all_predictions]
+        all_tags = []
+        transition_matrix = self.get_viterbi_pairwise_potentials()
+        start_transitions = self.get_start_transitions()
+        # **************** Different ********************
+        # We add in the offsets here so we can compute the un-wordpieced tags.
+        for predictions, length in zip(
+            predictions_list, sequence_lengths
+        ):
+            max_likelihood_sequence, _ = viterbi_decode(
+                predictions[:length], transition_matrix, allowed_start_transitions=start_transitions
+            )
+            tags = [
+                self.vocab.get_token_from_index(x, namespace=self._label_namespace)
+                for x in max_likelihood_sequence
+            ]
+
+            all_tags.append(tags)
+            # print(all_tags)
+        output_dict["tags"] = all_tags
         return output_dict
 
     @overrides
@@ -611,8 +825,22 @@ class CoreferenceResolver(Model):
             "mention_recall": mention_recall,
         }
         if self._predict_srl:
-            f1 = self._srl_metric.get_metric(reset)
+            f1 = self._srl_metric.get_metric(reset)["f1-measure-overall"]
             metrics["srl_f1"] = f1
+        if self._predict_ner:
+            if self._ner_sequence:
+                ner_metrics = self._ner_metric.get_metric(reset)
+                metrics["ner_f1"] = ner_metrics["f1-measure-overall"]
+                metrics["ner_precision"] = ner_metrics["precision-overall"]
+                metrics["ner_recall"] = ner_metrics["recall-overall"]
+            else:
+                try:
+                    ner_metrics = self._ner_metric.get_metric(reset)
+                    metrics["ner_f1"] = ner_metrics["fscore"]
+                    metrics["precision"] = ner_metrics["precision"]
+                    metrics["recall"] = ner_metrics["recall"]
+                except RuntimeError:
+                    metrics["ner_f1"] = 0
         return metrics
 
     @staticmethod
