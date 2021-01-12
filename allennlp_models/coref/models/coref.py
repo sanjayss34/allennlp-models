@@ -2,6 +2,7 @@ import logging
 import math
 from typing import Any, Dict, List, Tuple, cast
 import os
+import random
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import torch
@@ -98,6 +99,8 @@ class CoreferenceResolver(Model):
         ner_sequence: bool = True,
         ner_scorer: FeedForward = None,
         language_masking_map: Dict[str, bool] = None,
+        only_language_masking_map: Dict[str, bool] = None,
+        consistency_map: Dict[str, bool] = None,
         load_weights_path: str = None,
         initializer: InitializerApplicator = InitializerApplicator(),
         **kwargs
@@ -126,6 +129,8 @@ class CoreferenceResolver(Model):
             input_dim=text_field_embedder.get_output_dim()
         )
         self._language_masking_map = language_masking_map
+        self._only_language_masking_map = only_language_masking_map
+        self._consistency_map = consistency_map
 
         self._predict_srl = predict_srl
         self._predict_coref = predict_coref
@@ -227,7 +232,10 @@ class CoreferenceResolver(Model):
         self,  # type: ignore
         text: TextFieldTensors,
         spans: torch.IntTensor,
+        modified_text: TextFieldTensors = None,
+        modified_spans: torch.IntTensor = None,
         span_labels: torch.IntTensor = None,
+        span_loss_mask: torch.IntTensor = None,
         srl_labels: torch.LongTensor = None,
         srl_seq_labels: torch.LongTensor = None,
         srl_seq_indices: torch.LongTensor = None,
@@ -273,13 +281,83 @@ class CoreferenceResolver(Model):
         loss : `torch.FloatTensor`, optional
             A scalar loss to be optimised.
         """
+        loss = torch.tensor(0.).to(spans.device)
         if metadata is not None and "language" in metadata[0] and self._language_masking_map is not None and self._language_masking_map[metadata[0]["language"]]:
             key = self._text_field_embedder._ordered_embedder_keys[0]
             input_tensors = text[key]
             embedder = getattr(self._text_field_embedder, "token_embedder_"+key)
-            _, loss = embedder(**input_tensors, masked_lm=[self._language_masking_map[metadata[i]["language"]] for i in range(len(metadata))])
-            outputs = {"loss": loss}
-            return outputs
+            _, masked_lm_loss = embedder(**input_tensors, masked_lm=[self._language_masking_map[metadata[i]["language"]] for i in range(len(metadata))])
+            num_masking_languages = sum([1 if self._language_masking_map[lang] else 0 for lang in self._language_masking_map])
+            loss += masked_lm_loss/float(num_masking_languages)
+            if self._only_language_masking_map is not None and self._only_language_masking_map[metadata[0]["language"]]:
+                outputs = {"loss": loss}
+                return outputs
+        elif metadata is not None and "language" in metadata[0] and self._consistency_map[metadata[0]["language"]] and modified_text is not None:
+            assert modified_spans is not None
+            self.eval()
+            with torch.no_grad():
+                full_text_output_dict = self.make_output_human_readable(self.forward(text=text, spans=spans))
+            with torch.no_grad():
+                modified_text_output_dict = self.make_output_human_readable(self.forward(text=modified_text, spans=modified_spans))
+            self.train()
+            if "removed_text_start" in metadata[0] and "removed_text_end" in metadata[0]:
+                removed_text_start = metadata[0]["removed_text_start"]
+                removed_text_end = metadata[0]["removed_text_end"]
+            else:
+                removed_text_start = -1
+                removed_text_end = -1
+            removed_text_length = removed_text_end-removed_text_start
+            original_span_index_map = metadata[0]["span_index_map"]
+            original_clusters = []
+            exclude_mentions = set()
+            original_span_labels = -1*torch.ones_like(spans[:,:,0])
+            original_span_mask = torch.ones_like(spans[:,:,0])
+            for cluster in full_text_output_dict["clusters"][0]:
+                include = True
+                for mention in cluster:
+                    if mention[0] >= removed_text_start and mention[1] < removed_text_end:
+                        include = False
+                        break
+                if not include:
+                    for mention in cluster:
+                        exclude_mentions.add(tuple(mention))
+                        original_span_mask[0,original_span_index_map[tuple(mention)]] = 0
+                else:
+                    original_clusters.append(tuple((m[0]-removed_text_length, m[1]-removed_text_length) if m[0] >= removed_text_start else tuple(m) for m in cluster))
+                    for m in cluster:
+                        original_span_labels[0,original_span_index_map[tuple(m)]] = len(original_clusters)
+            original_span_labels_mapped = original_span_labels[:,metadata[0]["modified_span_indices"]]
+            modified_spans_masked = torch.where((original_span_mask[:,metadata[0]["modified_span_indices"]] > 0).unsqueeze(-1).repeat(1, 1, 2), modified_spans, -1*torch.ones_like(modified_spans))
+            modified_text_metadata = [{key: metadata[0][key] for key in metadata[0]}]
+            modified_text_metadata[0]["clusters"] = original_clusters
+            if ("modified_text_loss" in metadata[0] and metadata[0]["modified_text_loss"]) or ("modified_text_loss" not in metadata[0] and random.random() < 0.5):
+                modified_text_loss = self.forward(text=modified_text, spans=modified_spans_masked, span_labels=original_span_labels_mapped, metadata=modified_text_metadata)["loss"]
+                loss = modified_text_loss
+                full_text_output_dict["loss"] = loss
+                return full_text_output_dict
+            modified_span_labels = -1*torch.ones_like(spans[:,:,0])
+            modified_clusters = []
+            for cluster in modified_text_output_dict["clusters"][0]:
+                new_cluster = []
+                for mention in cluster:
+                    mention = tuple(mention)
+                    if mention[0] >= removed_text_start:
+                        mention = (mention[0]+removed_text_length, mention[1]+removed_text_length)
+                    if mention not in exclude_mentions:
+                        new_cluster.append(mention)
+                if len(new_cluster) > 1:
+                    modified_clusters.append(tuple(new_cluster))
+                    for mention in new_cluster:
+                        modified_span_labels[0,original_span_index_map[mention]] = len(modified_clusters)
+            original_spans_masked = torch.where((original_span_mask > 0).unsqueeze(-1).repeat(1, 1, 2), spans, -1*torch.ones_like(spans))
+            original_text_metadata = [{key: metadata[0][key] for key in metadata[0]}]
+            original_text_metadata[0]["clusters"] = modified_clusters
+            original_text_loss = self.forward(text=text, spans=original_spans_masked, span_labels=modified_span_labels, metadata=original_text_metadata)["loss"]
+            loss = original_text_loss
+            # loss = (modified_text_loss+original_text_loss)/2.0
+            full_text_output_dict["loss"] = loss
+            return full_text_output_dict
+
         # Shape: (batch_size, document_length, embedding_size)
         text_embeddings = self._lexical_dropout(self._text_field_embedder(text))
 
@@ -347,7 +425,6 @@ class CoreferenceResolver(Model):
             "top_spans": top_spans,
             "all_spans": spans
         }
-        loss = torch.tensor(0.0)
 
         if self._predict_srl and self._srl_e2e:
             word_span_mask = word_span_mask.to_dense()
@@ -678,6 +755,7 @@ class CoreferenceResolver(Model):
 
         if metadata is not None:
             output_dict["document"] = [x["original_text"] for x in metadata]
+            output_dict["document_id"] = [x["document_id"] for x in metadata]
         return output_dict
 
     def srl_seq_make_output_human_readable(
