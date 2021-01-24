@@ -41,7 +41,7 @@ class BatchLpsmap(torch.nn.Module):
         for constraint in constraint_sets:
             for var in constraint:
                 self.variable_degrees[0][var] += 1
-        self.variable_degrees = torch.tensor(self.variable_degrees, dtype=torch.float64, device=device)
+        self.variable_degrees = torch.tensor(self.variable_degrees, dtype=torch.float32, device=device)
         self.variable_degrees = self.variable_degrees.repeat(batch_size, 1)
         self.variable_selector_list = []
         self.batch_size = batch_size
@@ -60,7 +60,7 @@ class BatchLpsmap(torch.nn.Module):
             var_selector_indices = torch.cat((batch_range.unsqueeze(1).repeat(1, col_indices.numel()).view(1, -1),
                                               row_indices.unsqueeze(0).repeat(batch_size, 1).view(1, -1),
                                               col_indices.unsqueeze(0).repeat(batch_size, 1).view(1, -1)), dim=0)
-            var_selector_values = torch.ones_like(var_selector_indices[0,:]).double()
+            var_selector_values = torch.ones_like(var_selector_indices[0,:]).float()
             var_selector = torch.sparse.FloatTensor(var_selector_indices, var_selector_values, torch.Size([batch_size, len(constraint_sets[i]), self.num_variables])).to(self.device)
             variable_selector_list.append(var_selector)
         return variable_selector_list
@@ -90,5 +90,5 @@ class BatchLpsmap(torch.nn.Module):
             lpsmap_inputs = self.lpsmap_inputs
         # result = lpsmap(scores, variable_selector_list, self.constraint_sets, self.constraint_types, self.constraint_sizes, self.budgets, self.negated, variable_degrees, self.max_iter)
         # result = LpsmapFunction.apply(scores, variable_selector_list, self.constraint_sets, self.constraint_types, self.constraint_sizes, self.budgets, self.negated, variable_degrees, self.max_iter)
-        result = lpsmap_forward(*([scores.double()]+lpsmap_inputs))[0]
+        result = lpsmap_forward(*([scores.float()]+lpsmap_inputs))[0]
         return result
