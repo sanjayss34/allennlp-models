@@ -12,7 +12,7 @@ from overrides import overrides
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.models.model import Model
 from allennlp.modules.token_embedders import Embedding
-from allennlp.modules import FeedForward, GatedSum, ConditionalRandomField
+from allennlp.modules import FeedForward, GatedSum, ConditionalRandomField, MatrixAttention
 from allennlp.modules.matrix_attention import BilinearMatrixAttention
 from allennlp.modules.conditional_random_field import allowed_transitions
 from allennlp.modules import Seq2SeqEncoder, TimeDistributed, TextFieldEmbedder
@@ -28,10 +28,13 @@ from allennlp_models.common.feedforward_layernorm import FeedForwardWithLayerNor
 
 from allennlp_models.structured_prediction.modules.batch_lpsmap import BatchLpsmap
 from allennlp_models.structured_prediction.modules.lpsmap_loss import LpsmapLoss
+from allennlp_models.structured_prediction.tools.srl_dp_decode import dp_decode
+from allennlp_models.structured_prediction.metrics.consistency import StructureConsistencyMetric
 
-from lpsmap import TorchFactorGraph, Xor, Budget, AtMostOne
+from lpsmap import TorchFactorGraph, Xor, Budget, AtMostOne, Imply
 
 import torch_struct
+from entmax import sparsemax, entmax15
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,7 @@ class CoreferenceResolver(Model):
         srl_lpsmap: bool = False,
         srl_lpsmap_max_iter: int = 10,
         srl_lpsmap_overlapping_spans: bool = False,
+        srl_dp_decode: bool = False,
         max_sentence_length: int = 210, # longest sentence in English Ontonotes training data
         predict_ner: bool = False,
         ner_sequence: bool = True,
@@ -121,16 +125,31 @@ class CoreferenceResolver(Model):
         consistency_map: Dict[str, bool] = None,
         consistency_with_supervised_loss: bool = True,
         consistency_loss_coefficient: float = 1.0,
+        consistency_eval_mode: bool = False,
+        consistency_hard: bool = False,
+        consistency_symmetric: bool = True,
+        consistency_average: str = "batchmean",
+        consistency_full_no_grad: bool = False,
+        consistency_confidence_threshold: float = 0.0,
+        dummy_parameter: bool = False,
         mention_score_loss: bool = False,
         load_weights_path: str = None,
         load_all_weights_path: str = None,
         non_span_rep_model: bool = False,
+        non_span_rep_refactor: bool = False,
         start_feedforward1: FeedForwardWithLayerNorm = None,
         end_feedforward1: FeedForwardWithLayerNorm = None,
         start_feedforward2: FeedForwardWithLayerNorm = None,
         end_feedforward2: FeedForwardWithLayerNorm = None,
         consistency_epoch_threshold: int = 0,
         bug_fix: bool = False,
+        parallel_consistency: bool = False,
+        parallel_alignment_activation: str = "softmax",
+        parallel_alignment_attention: MatrixAttention = None,
+        parallel_consistency_coefficient: float = 1.0,
+        parallel_alignment_agreement_coefficient: float = 1.0,
+        parallel_lpsmap: bool = False,
+        parallel_asymmetric: bool = False,
         initializer: InitializerApplicator = InitializerApplicator(),
         **kwargs
     ) -> None:
@@ -139,6 +158,7 @@ class CoreferenceResolver(Model):
         self._text_field_embedder = text_field_embedder
         self._context_layer = context_layer
         self._non_span_rep_model = non_span_rep_model
+        self._non_span_rep_refactor = non_span_rep_refactor
         if non_span_rep_model:
             self._start_feedforward1 = start_feedforward1
             self._end_feedforward1 = end_feedforward1
@@ -148,11 +168,22 @@ class CoreferenceResolver(Model):
             hidden_size = start_feedforward1.get_output_dim()
             self._mention_scorer_start = torch.nn.Linear(hidden_size, 1)
             self._mention_scorer_end = torch.nn.Linear(hidden_size, 1)
-            self._mention_scorer_bilinear = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
-            self._antecedent_scorer_start_start = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
+            if non_span_rep_refactor:
+                self._mention_scorer_bilinear = torch.nn.Linear(hidden_size, hidden_size)
+                self._antecedent_scorer_start_start = torch.nn.Linear(hidden_size, hidden_size)
+                self._antecedent_scorer_start_end = torch.nn.Linear(hidden_size, hidden_size)
+                self._antecedent_scorer_end_start = torch.nn.Linear(hidden_size, hidden_size)
+                self._antecedent_scorer_end_end = torch.nn.Linear(hidden_size, hidden_size)
+            else:
+                self._mention_scorer_bilinear = BilinearMatrixAttention(hidden_size, hidden_size)
+                self._antecedent_scorer_start_start = BilinearMatrixAttention(hidden_size, hidden_size)
+                self._antecedent_scorer_start_end = BilinearMatrixAttention(hidden_size, hidden_size)
+                self._antecedent_scorer_end_start = BilinearMatrixAttention(hidden_size, hidden_size)
+                self._antecedent_scorer_end_end = BilinearMatrixAttention(hidden_size, hidden_size)
+            """self._antecedent_scorer_start_start = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
             self._antecedent_scorer_start_end = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
             self._antecedent_scorer_end_start = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
-            self._antecedent_scorer_end_end = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)
+            self._antecedent_scorer_end_end = torch.nn.Linear(hidden_size, hidden_size) # BilinearMatrixAttention(hidden_size, hidden_size)"""
         else:
             self._mention_feedforward = TimeDistributed(mention_feedforward)
             self._mention_scorer = TimeDistributed(
@@ -181,10 +212,35 @@ class CoreferenceResolver(Model):
         self._consistency_epoch_threshold = consistency_epoch_threshold
         self._consistency_with_supervised_loss = consistency_with_supervised_loss
         self._consistency_loss_coefficient = consistency_loss_coefficient
+        self._consistency_eval_mode = consistency_eval_mode
+        self._consistency_hard = consistency_hard
+        self._consistency_symmetric = consistency_symmetric
+        self._consistency_average = consistency_average
+        self._consistency_full_no_grad = consistency_full_no_grad
+        self._consistency_confidence_threshold = consistency_confidence_threshold
+        if dummy_parameter:
+            self._dummy_parameter = torch.nn.Parameter(torch.zeros((1, 1)))
+        else:
+            self._dummy_parameter = None
+
+        self._parallel_consistency = parallel_consistency
+        self._parallel_lpsmap = parallel_lpsmap
+        self._parallel_asymmetric = parallel_asymmetric
+        if parallel_consistency:
+            self._parallel_consistency_metric = StructureConsistencyMetric()
+            activations = {"softmax": torch.nn.functional.softmax,
+                           "sparsemax": sparsemax,
+                           "entmax15": entmax15}
+            self._parallel_alignment_activation = activations[parallel_alignment_activation]
+            self._parallel_alignment_attention = parallel_alignment_attention
+            self._parallel_consistency_coefficient = parallel_consistency_coefficient
+            self._parallel_consistency_labels = [i for i in range(self.vocab.get_vocab_size("ner_seq_labels")) if self.vocab.get_token_from_index(i, namespace="ner_seq_labels")[:2] == "B-"]
+            self._parallel_alignment_agreement_coefficient = parallel_alignment_agreement_coefficient
 
         self._predict_srl = predict_srl
         self._predict_coref = predict_coref
         self._predict_ner = predict_ner
+        self._lpsmap_max_iter = srl_lpsmap_max_iter
         if predict_srl:
             if srl_predicate_feedforward1 is not None:
                 self._srl_predicate_feedforward1 = TimeDistributed(srl_predicate_feedforward1)
@@ -230,6 +286,7 @@ class CoreferenceResolver(Model):
             self._srl_dropout = torch.nn.Dropout(p=srl_dropout)
             self._predicate_candidates_per_word = srl_predicate_candidates_per_word
             self._srl_e2e = srl_e2e
+            self._srl_dp_decode = srl_dp_decode
             if srl_e2e:
                 self._srl_metric = E2eSrlMetric()
             else:
@@ -241,35 +298,12 @@ class CoreferenceResolver(Model):
                     self.vocab.get_vocab_size(label_namespace), constraints, include_start_end_transitions=True
                 )
             self._lpsmap = srl_lpsmap
-            self._lpsmap_max_iter = srl_lpsmap_max_iter
             self._lpsmap_overlapping_spans_srl = srl_lpsmap_overlapping_spans
             self._max_num_spans = int(spans_per_word*max_sentence_length)
             self._max_num_predicates = int(srl_predicate_candidates_per_word*max_sentence_length)
-            if srl_lpsmap:
-                self.constraint_types = []
-                self.constraint_sizes = []
-                self.budgets = []
-                self.coefficients = []
-                self.negated = []
-                self.constraint_sets = []
-                self.num_variables = self._max_num_spans*(1+self.vocab.get_vocab_size(namespace=label_namespace))
-                # Exactly one label (possibly null) per predicate
-                self.constraint_types.append("xor")
-                self.constraint_sizes.append(1+self.vocab.get_vocab_size(namespace=label_namespace))
-                self.budgets.append(1)
-                self.negated.append([False for _ in range(self.constraint_sizes[-1])])
-                self.coefficients.append([1 for _ in self.negated[-1]])
-                self.constraint_sets.append([i for span in range(self._max_num_spans) for i in range(span*self.constraint_sizes[-1], (span+1)*self.constraint_sizes[-1])])
-                # At most one argument for each core role
-                self.constraint_types.append("budget")
-                self.constraint_sizes.append(self._max_num_spans)
-                self.budgets.append(1)
-                self.negated.append([False for _ in range(self.constraint_sizes[-1])])
-                self.coefficients.append([1 for _ in self.negated[-1]])
-                label_vocab = self.vocab.get_token_to_index_vocabulary(label_namespace)
-                self.core_role_labels = [self.vocab.get_token_index(role, namespace=label_namespace) for role in ["ARG0", "ARG1", "ARG2", "ARG3", "ARG4", "ARG5"] if role in label_vocab]
-                self.constraint_sets.append([span*self.constraint_sizes[0]+label for label in self.core_role_labels for span in range(self._max_num_spans)])
-                self._batch_lpsmap = None
+            if srl_e2e:
+                self.core_role_labels_string = ["ARG", "ARG1", "ARG2", "ARG3", "ARG4", "ARG5"]
+                self.core_role_labels = [self.vocab.get_token_index(role, namespace=label_namespace) for role in self.core_role_labels_string if role in self.vocab.get_token_to_index_vocabulary(label_namespace)]
         self._ner_sequence = ner_sequence
         if predict_ner:
             if ner_sequence:
@@ -319,6 +353,7 @@ class CoreferenceResolver(Model):
 
         self._mention_recall = MentionRecall()
         self._conll_coref_scores = ConllCorefScores()
+        self._consistency_conll_coref_scores = ConllCorefScores()
         if lexical_dropout > 0:
             self._lexical_dropout = torch.nn.Dropout(p=lexical_dropout)
         else:
@@ -334,6 +369,65 @@ class CoreferenceResolver(Model):
             state = torch.load(load_all_weights_path)
             self.load_state_dict(state)
         self.epoch = -1
+
+    def setup_constraints(self, num_spans, document_length, top_spans, batch_size):
+        self.constraint_types = []
+        self.constraint_sizes = []
+        self.budgets = []
+        self.coefficients = []
+        self.negated = []
+        self.constraint_sets = []
+        label_namespace = "srl_labels"
+        num_labels = 1+self.vocab.get_vocab_size(namespace=label_namespace)
+        if self._lpsmap_overlapping_spans_srl:
+            num_labels += 1
+        # Exactly one label (possibly null) per predicate
+        self.constraint_types.append("xor")
+        if self._lpsmap_overlapping_spans_srl:
+            self.constraint_sizes.append(num_labels-1)
+        else:
+            self.constraint_sizes.append(num_labels)
+        self.budgets.append(1)
+        self.negated.append([False for _ in range(self.constraint_sizes[-1])])
+        self.coefficients.append([1 for _ in self.negated[-1]])
+        self.constraint_sets.append([i for span in range(num_spans) for i in range(span*num_labels, (span+1)*num_labels-(1 if self._lpsmap_overlapping_spans_srl else 0))])
+        # At most one argument for each core role
+        self.constraint_types.append("budget")
+        self.constraint_sizes.append(num_spans)
+        self.budgets.append(1)
+        self.negated.append([False for _ in range(self.constraint_sizes[-1])])
+        self.coefficients.append([1 for _ in self.negated[-1]])
+        label_vocab = self.vocab.get_token_to_index_vocabulary(label_namespace)
+        self.constraint_sets.append([span*num_labels+label for label in self.core_role_labels for span in range(num_spans)])
+        self.non_uniform_constraint_types = []
+        self.non_uniform_constraint_sets = []
+        self.non_uniform_constraint_sizes = []
+        self.non_uniform_constraint_budgets = []
+        self.non_uniform_constraint_negated = []
+        self.non_uniform_constraint_coefficients = []
+        if self._lpsmap_overlapping_spans_srl:
+            # Two overlapping spans cannot be assigned a role for a single predicate
+            self.non_uniform_constraint_types.append("budget")
+            variables = [[[] for _ in range(document_length)] for _ in range(batch_size)]
+            for word in range(document_length):
+                spans_including_word_mask = (top_spans[:,:,0] <= word) & (top_spans[:,:,1] >= word)
+                spans_including_word = spans_including_word_mask.nonzero().tolist()
+                for i in range(len(spans_including_word)):
+                    variables[spans_including_word[i][0]][word] += list(range(spans_including_word[i][1]*num_labels+1, (spans_including_word[i][1]+1)*num_labels))
+            max_length = max([len(lst) for batch in variables for lst in batch])
+            variables = [[lst+[num_labels-1 for _ in range(max_length-len(lst))] for i, lst in enumerate(batch)] for batch in variables]
+            self.non_uniform_constraint_sets.append(variables)
+            self.non_uniform_constraint_sizes.append(max_length)
+            self.non_uniform_constraint_budgets.append(1)
+            self.non_uniform_constraint_negated.append([False for _ in range(max_length)])
+            self.non_uniform_constraint_coefficients.append([1 for _ in range(max_length)])
+            # Need to disqualify the num_labels-1 label
+            self.constraint_types.append("budget")
+            self.constraint_sizes.append(num_spans)
+            self.budgets.append(0)
+            self.negated.append([False for _ in range(self.constraint_sizes[-1])])
+            self.coefficients.append([1 for _ in self.negated[-1]])
+            self.constraint_sets.append([(span+1)*num_labels-1 for span in range(num_spans)])
 
     @overrides
     def forward(
@@ -352,6 +446,8 @@ class CoreferenceResolver(Model):
         ner_span_labels: torch.LongTensor = None,
         word_span_mask: torch.IntTensor = None,
         metadata: List[Dict[str, Any]] = None,
+        consistency_metric: bool = False,
+        parallel_text: TextFieldTensors = None,
     ) -> Dict[str, torch.Tensor]:
 
         """
@@ -389,7 +485,7 @@ class CoreferenceResolver(Model):
         loss : `torch.FloatTensor`, optional
             A scalar loss to be optimised.
         """
-        loss = torch.tensor(0., requires_grad=True).to(spans.device)
+        loss = torch.tensor(0.).to(spans.device)
         # if metadata is not None and modified_text is None:
         #     logger.info(metadata[0]["language"])
         if metadata is not None and "language" in metadata[0] and self._language_masking_map is not None and self._language_masking_map[metadata[0]["language"]]:
@@ -406,15 +502,25 @@ class CoreferenceResolver(Model):
         elif modified_text is not None and (self._consistency_epoch_threshold is None or self.epoch >= self._consistency_epoch_threshold):
             assert modified_spans is not None
             assert self._predict_coref
-            assert self._non_span_rep_model
+            assert self._non_span_rep_model or not self.training
             training_mode = self.training
-            if self.training:
+            logger.info('here1')
+            if self._consistency_eval_mode:
+                self.eval()
+            if training_mode and span_labels is None:
+                if self._consistency_full_no_grad:
+                    with torch.no_grad():
+                        full_text_output_dict = self.make_output_human_readable(self.forward(text=text, spans=spans.clone()))
+                else:
+                    full_text_output_dict = self.make_output_human_readable(self.forward(text=text, spans=spans.clone()))
+            elif span_labels is not None:
                 full_text_output_dict = self.make_output_human_readable(self.forward(text=text, spans=spans.clone(), span_labels=span_labels, metadata=metadata))
             else:
                 full_text_output_dict = self.make_output_human_readable(self.forward(text=text, spans=spans.clone()))
-
+            if self._consistency_eval_mode and training_mode and (not self._consistency_symmetric):
+                self.train()
             if (self._consistency_with_supervised_loss or span_labels is None): # and self.training:
-                # logger.info('here')
+                logger.info('here')
                 if "removed_text_start" in metadata[0] and "removed_text_end" in metadata[0]:
                     removed_text_start = metadata[0]["removed_text_start"]
                     removed_text_end = metadata[0]["removed_text_end"]
@@ -447,20 +553,21 @@ class CoreferenceResolver(Model):
                 assert len(metadata[0]["modified_span_indices"]) == modified_spans.shape[1]
                 assert (modified_spans == torch.where(spans[:,metadata[0]["modified_span_indices"],:] >= removed_text_start, spans[:,metadata[0]["modified_span_indices"],:]-removed_text_length, spans[:,metadata[0]["modified_span_indices"],:])).all().item()
                 original_span_labels_mapped = original_span_labels[:,metadata[0]["modified_span_indices"]]
-                if self.training:
-                    modified_text_outputs = self.forward(text=modified_text, spans=modified_spans)
-                else:
-                    modified_metadata = [{key: m[key] for key in m} for m in metadata]
-                    modified_metadata[0]["clusters"] = original_clusters
-                    modified_text_outputs = self.forward(text=modified_text, spans=modified_spans, span_labels=-1*torch.ones_like(modified_spans[:,:,0]), metadata=modified_metadata)
+                # if training_mode:
+                modified_metadata = [{key: m[key] for key in m} for m in metadata]
+                modified_metadata[0]["clusters"] = original_clusters
                 modified_spans_masked = torch.where((original_span_mask[:,metadata[0]["modified_span_indices"]] > 0).unsqueeze(-1).repeat(1, 1, 2), modified_spans, -1*torch.ones_like(modified_spans))
                 mention_mask = modified_spans_masked[0,:,0] > -1
+                modified_text_outputs = self.forward(text=modified_text, spans=modified_spans, span_loss_mask=mention_mask.unsqueeze(0), span_labels=-1*torch.ones_like(modified_spans[:,:,0]), metadata=modified_metadata, consistency_metric=True)
                 full_text_span_mention_distributions = torch.cat((torch.zeros_like(full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]]).unsqueeze(-1),
                     full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]].unsqueeze(-1)), dim=1).log_softmax(dim=1)[mention_mask,:]
                 modified_text_span_mention_distributions = torch.cat((torch.zeros_like(modified_text_outputs["span_mention_scores"][0,:].unsqueeze(-1)),
                     modified_text_outputs["span_mention_scores"][0,:].unsqueeze(-1)), dim=1).log_softmax(dim=1)[mention_mask,:]
                 if self._mention_score_loss:
-                    mention_scores_loss = (torch.nn.BCEWithLogitsLoss()(modified_text_outputs["span_mention_scores"][0,mention_mask], full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]][mention_mask].sigmoid())+torch.nn.BCEWithLogitsLoss()(full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]][mention_mask], modified_text_outputs["span_mention_scores"][0,mention_mask].sigmoid()))/2
+                    if self._consistency_symmetric:
+                        mention_scores_loss = (torch.nn.BCEWithLogitsLoss()(modified_text_outputs["span_mention_scores"][0,mention_mask], full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]][mention_mask].sigmoid())+torch.nn.BCEWithLogitsLoss()(full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]][mention_mask], modified_text_outputs["span_mention_scores"][0,mention_mask].sigmoid()))/2
+                    else:
+                        mention_scores_loss = torch.nn.BCEWithLogitsLoss()(modified_text_outputs["span_mention_scores"][0,mention_mask], full_text_output_dict["span_mention_scores"][0,metadata[0]["modified_span_indices"]][mention_mask].sigmoid())
                     # logger.info(mention_scores_loss)
                     # mention_scores_loss = (torch.nn.KLDivLoss(reduction="batchmean")(modified_text_span_mention_distributions, full_text_span_mention_distributions)+torch.nn.KLDivLoss(reduction="batchmean")(full_text_span_mention_distributions, modified_text_span_mention_distributions))/2
                     # if mention_scores_loss.item() <= full_text_output_dict["loss"].item():
@@ -510,7 +617,19 @@ class CoreferenceResolver(Model):
                         )
                         modified_pruned_coreference_probs = util.masked_softmax(modified_pruned_coreference_scores, modified_pruned_antecedent_mask)
                         # antecedent_loss = 0.5*(-original_pruned_coreference_probs*modified_pruned_coreference_log_probs-modified_pruned_coreference_probs*original_pruned_coreference_log_probs).sum(1).mean()
-                        antecedent_loss = 0.5*(torch.nn.KLDivLoss(reduction="mean")(original_pruned_coreference_log_probs, modified_pruned_coreference_probs)+torch.nn.KLDivLoss(reduction="mean")(modified_pruned_coreference_log_probs, original_pruned_coreference_probs))
+                        if self._consistency_symmetric:
+                            antecedent_loss = 0.5*(torch.nn.KLDivLoss(reduction=self._consistency_average, log_target=True)(original_pruned_coreference_log_probs, modified_pruned_coreference_log_probs)+torch.nn.KLDivLoss(reduction=self._consistency_average, log_target=True)(modified_pruned_coreference_log_probs, original_pruned_coreference_log_probs))
+                        else:
+                            if self._consistency_confidence_threshold > 0:
+                                antecedent_loss = torch.nn.KLDivLoss(reduction="none", log_target=True)(modified_pruned_coreference_log_probs, original_pruned_coreference_log_probs)
+                                antecedent_loss = torch.where(original_pruned_coreference_probs.max(-1)[0].unsqueeze(-1).repeat(1, original_pruned_coreference_probs.shape[1]) > self._consistency_confidence_threshold, antecedent_loss, torch.zeros_like(antecedent_loss))
+                                if self._consistency_average == "mean":
+                                    antecedent_loss = antecedent_loss.mean()
+                                else:
+                                    antecedent_loss = antecedent_loss.sum()/float(original_pruned_coreference_probs.shape[0])
+                            else:
+                                antecedent_loss = torch.nn.functional.kl_div(modified_pruned_coreference_log_probs, original_pruned_coreference_log_probs, reduction=self._consistency_average, log_target=True)
+                        # antecedent_loss = 0.5*((torch.nn.KLDivLoss(reduction="none")(original_pruned_coreference_log_probs, modified_pruned_coreference_probs)+torch.nn.KLDivLoss(reduction="none")(modified_pruned_coreference_log_probs, original_pruned_coreference_probs))*modified_pruned_antecedent_mask.float()).sum()/modified_pruned_antecedent_mask.float().sum()
                         # logger.info('A '+str(original_pruned_coreference_log_probs))
                         # logger.info('B '+str(modified_pruned_coreference_log_probs))
                         # logger.info('C '+str(antecedent_loss))
@@ -523,12 +642,21 @@ class CoreferenceResolver(Model):
 
                 """modified_text_loss = modified_text_outputs_grad["loss"]
                 loss = modified_text_loss"""
+            if self._consistency_eval_mode and training_mode:
+                self.train()
 
+            # full_text_output_dict["loss"] += 0.*self._text_field_embedder(text).sum()
             return full_text_output_dict
 
         # Shape: (batch_size, document_length, embedding_size)
+        # print(text["tokens"]["token_ids"].shape)
         text_embeddings = self._lexical_dropout(self._text_field_embedder(text))
-        loss += 0.*text_embeddings.sum()
+        if self._dummy_parameter is not None:
+            loss += 0.*self._dummy_parameter.sum()
+
+        if parallel_text is not None:
+            parallel_text_embeddings = self._lexical_dropout(self._text_field_embedder(parallel_text))
+            parallel_text_mask = util.get_text_field_mask(parallel_text)
 
         batch_size = spans.size(0)
         document_length = text_embeddings.size(1)
@@ -555,28 +683,173 @@ class CoreferenceResolver(Model):
         # Shape: (batch_size, document_length, encoding_dim)
         contextualized_embeddings = self._context_layer(text_embeddings, text_mask)
 
+        if parallel_text is not None:
+            parallel_contextualized_embeddings = self._context_layer(parallel_text_embeddings, parallel_text_mask)
+
+        output_dict = {}
         if self._predict_ner and self._ner_sequence and self._ner_tag_embedding_dim == 0:
             classifier_outputs = self._ner_scorer(contextualized_embeddings)
+            if not self.training:
+                viterbi_output = self.ner_crf.viterbi_tags(
+                    classifier_outputs,
+                    text_mask,
+                    top_k=1
+                )
+                predicted_tags = cast(List[List[int]], [x[0][0] for x in viterbi_output])
+                # Represent viterbi tags as "class probabilities" that we can
+                # feed into the metrics
+                class_probabilities = classifier_outputs * 0.0
+                for i, instance_tags in enumerate(predicted_tags):
+                    for j, tag_id in enumerate(instance_tags):
+                        class_probabilities[i, j, tag_id] = 1
+                predicted_string_tags = [[self.vocab.get_token_from_index(i, namespace="ner_seq_labels") for i in lst] for lst in predicted_tags]
+                output_dict["ner_predictions"] = predicted_string_tags
             if ner_seq_labels is not None:
                 loss += -self.ner_crf(classifier_outputs, ner_seq_labels, text_mask)/text_mask.sum().float()
                 if not self.training:
-                    viterbi_output = self.ner_crf.viterbi_tags(
-                        classifier_outputs,
-                        text_mask,
-                        top_k=1
-                    )
-                    predicted_tags = cast(List[List[int]], [x[0][0] for x in viterbi_output])
-                    # Represent viterbi tags as "class probabilities" that we can
-                    # feed into the metrics
-                    class_probabilities = classifier_outputs * 0.0
-                    for i, instance_tags in enumerate(predicted_tags):
-                        for j, tag_id in enumerate(instance_tags):
-                            class_probabilities[i, j, tag_id] = 1
                     self._ner_metric(class_probabilities, ner_seq_labels, text_mask)
-                    predicted_string_tags = [[self.vocab.get_token_from_index(i, namespace="ner_seq_labels") for i in lst] for lst in predicted_tags]
-                    output_dict["ner_predictions"] = predicted_string_tags
                     if metadata is not None:
                         output_dict["ner_seq_labels"] = [x["ner_seq_labels"] for x in metadata]
+            if parallel_text is not None and self._parallel_consistency:
+                parallel_classifier_outputs = self._ner_scorer(parallel_contextualized_embeddings)
+                parallel_document_length = parallel_text_mask.shape[1]
+                alignment_logits = self._parallel_alignment_attention(contextualized_embeddings,
+                                                                      parallel_contextualized_embeddings)
+                alignment_logits = alignment_logits.view(batch_size, document_length, parallel_contextualized_embeddings.shape[1])
+                alignment_logits = util.replace_masked_values(
+                    alignment_logits,
+                    text_mask.unsqueeze(-1).repeat(1, 1, parallel_document_length),
+                    util.min_value_of_dtype(alignment_logits.dtype)
+                )
+                alignment_logits = util.replace_masked_values(
+                    alignment_logits,
+                    parallel_text_mask.unsqueeze(1).repeat(1, document_length, 1),
+                    util.min_value_of_dtype(alignment_logits.dtype)
+                )
+                if self.training:
+                    if self._parallel_lpsmap:
+                        num_labels = self.vocab.get_vocab_size("ner_seq_labels")
+                        alignment_probs1 = []
+                        alignment_probs2 = []
+                        for i in range(batch_size):
+                            fg = TorchFactorGraph()
+                            logits1 = torch.cat((classifier_outputs[i,:,:], alignment_logits[i,:,:]), dim=-1)
+                            logits2 = torch.cat((parallel_classifier_outputs[i,:,:], alignment_logits.permute(0, 2, 1)[i,:,:]), dim=-1)
+                            all_logits = torch.cat((logits1.view(-1), logits2.view(-1)), dim=0)
+                            x = fg.variable_from(all_logits.cpu())
+                            for index in range(document_length):
+                                # Exactly one label must be chosen for each position
+                                fg.add(Xor(x[[index*(num_labels+parallel_document_length)+label for label in range(num_labels)]]))
+                                for index2 in range(parallel_document_length):
+                                    # If no B- label is assigned to a position, that position shouldn't be aligned with any parallel position
+                                    fg.add(Imply(x[[index*(num_labels+parallel_document_length)+label for label in self._parallel_consistency_labels]+[index*(num_labels+parallel_document_length)+num_labels+index2]], negated=[True for _ in self._parallel_consistency_labels]+[True]))
+                                for label in self._parallel_consistency_labels:
+                                    # If position is not aligned with any parallel position, then no B- label should be assigned to this position
+                                    fg.add(Imply(x[[index*(num_labels+parallel_document_length)+num_labels+index2 for index2 in range(parallel_document_length)]+[index*(num_labels+parallel_document_length)+label]], negated=[True for _ in range(parallel_document_length+1)]))
+                                # Each position can be aligned with at most one parallel position
+                                fg.add(AtMostOne(x[[index*(num_labels+parallel_document_length)+num_labels+index2 for index2 in range(parallel_document_length)]]))
+                            for index2 in range(parallel_document_length):
+                                # Exactly one label must be chosen for each position
+                                fg.add(Xor(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label for label in range(num_labels)]]))
+                                for index in range(document_length):
+                                    # If no B- label is assigned to a position, that position shouldn't be aligned with any parallel position
+                                    fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label for label in self._parallel_consistency_labels]+[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index]], negated=[True for _ in self._parallel_consistency_labels]+[True]))
+                                for label in self._parallel_consistency_labels:
+                                    # If position is not aligned with any parallel position, then no B- label should be assigned to this position
+                                    fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index for index in range(document_length)]+[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label]], negated=[True for _ in range(document_length+1)]))
+                                # Each position can be aligned with at most one parallel position
+                                fg.add(AtMostOne(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index for index in range(document_length)]]))
+                            for index in range(document_length):
+                                for index2 in range(parallel_document_length):
+                                    for label in self._parallel_consistency_labels:
+                                        # Aligned positions must have the same label
+                                        fg.add(Imply(x[[index*(num_labels+parallel_document_length)+label, index*(num_labels+parallel_document_length)+num_labels+index2, document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label]]))
+                                        fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label, document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index, index*(num_labels+parallel_document_length)+label]]))
+                            fg.solve(max_iter=self._lpsmap_max_iter)
+                            alignment_probs1.append(x.value[:document_length*(num_labels+parallel_document_length)].contiguous().view(document_length, num_labels+parallel_document_length)[:,num_labels:].to(all_logits.device))
+                            alignment_probs2.append(x.value[document_length*(num_labels+parallel_document_length):].contiguous().view(parallel_document_length, num_labels+document_length)[:,num_labels:].to(all_logits.device))
+                        alignment_probs1 = torch.stack(alignment_probs1)
+                        alignment_probs2 = torch.stack(alignment_probs2)
+                        classifier_probs = classifier_outputs.softmax(dim=-1)
+                        parallel_classifier_probs = parallel_classifier_outputs.softmax(dim=-1)
+                        likelihood1 = (classifier_probs.unsqueeze(-2)*parallel_classifier_outputs.log_softmax(dim=-1).unsqueeze(1)*alignment_probs1.unsqueeze(-1)).sum()/(document_length*batch_size)
+                        likelihood2 = (parallel_classifier_probs.unsqueeze(-2)*classifier_outputs.log_softmax(dim=-1).unsqueeze(1)*alignment_probs2.unsqueeze(-1)).sum()/(parallel_document_length*batch_size)
+                        loss += self._parallel_consistency_coefficient*(-likelihood1-likelihood2)
+                    else:
+                        eps = 1e-10
+                        num_labels = self.vocab.get_vocab_size("ner_seq_labels")
+                        alignment_probs1 = self._parallel_alignment_activation(alignment_logits, dim=-1) # .clamp(min=eps, max=1.-eps)
+                        alignment_probs2 = self._parallel_alignment_activation(alignment_logits, dim=1) # .clamp(min=eps, max=1.-eps)
+                        classifier_probs = util.masked_softmax(classifier_outputs, text_mask.unsqueeze(-1), memory_efficient=True)
+                        parallel_classifier_probs = util.masked_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1), memory_efficient=True)
+                        classifier_complement_probs = torch.where(text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-classifier_probs, 1.5*torch.ones_like(classifier_probs))
+                        parallel_classifier_complement_probs = torch.where(parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-parallel_classifier_probs, 1.5*torch.ones_like(parallel_classifier_probs))
+                        classifier_log_probs = util.masked_log_softmax(classifier_outputs, text_mask.unsqueeze(-1))
+                        parallel_classifier_log_probs = util.masked_log_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1))
+                        parallel_consistency_loss = 0.0
+                        for label in self._parallel_consistency_labels:
+                            if self._parallel_asymmetric:
+                                parallel_consistency_loss -= (classifier_probs[:,:,label].max(1)[0].detach()*parallel_classifier_log_probs[:,:,label].max(1)[0]+classifier_complement_probs[:,:,label].min(1)[0].detach()*parallel_classifier_complement_probs[:,:,label].min(1)[0].log()).sum()/batch_size
+                            else:
+                                parallel_consistency_loss -= (classifier_probs[:,:,label].max(1)[0]*parallel_classifier_log_probs[:,:,label].max(1)[0]+classifier_complement_probs[:,:,label].min(1)[0]*parallel_classifier_complement_probs[:,:,label].min(1)[0].log()).sum()/batch_size
+                            """alignment_score_product_dim1 = alignment_probs2*classifier_probs[:,:,label].unsqueeze(-1)
+                            alignment_score_product_dim2 = alignment_probs1*parallel_classifier_probs[:,:,label].unsqueeze(1)
+                            loss_contributions_dim2 = torch.where(
+                                parallel_text_mask,
+                                (alignment_score_product_dim1.sum(1).log()-util.masked_log_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1))[:,:,label]).clamp_max(max=0.0),
+                                torch.zeros_like(alignment_score_product_dim1.sum(1))
+                            )
+                            loss_contributions_dim1 = torch.where(
+                                text_mask,
+                                (alignment_score_product_dim2.sum(-1).log()-util.masked_log_softmax(classifier_outputs, text_mask.unsqueeze(-1))[:,:,label]).clamp_max(max=0.0),
+                                torch.zeros_like(alignment_score_product_dim2.sum(-1))
+                            )
+                            parallel_consistency_loss -= loss_contributions_dim1.sum()/text_mask.sum().float()+loss_contributions_dim2.sum()/parallel_text_mask.sum().float()
+                            print(self.vocab.get_token_from_index(label, namespace="ner_seq_labels"))
+                            print('A', classifier_probs[:,:,label])
+                            print('B', parallel_classifier_probs[:,:,label])
+                        alignment1_loss = torch.where(
+                            text_mask.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, document_length, parallel_text_mask.shape[1]) & parallel_text_mask.unsqueeze(1).unsqueeze(1).repeat(1, document_length, document_length, 1) & (1-torch.eye(alignment_probs1.shape[1]).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1, parallel_text_mask.shape[1]).to(text_mask.device) > 0),
+                            ((1.-alignment_probs1.unsqueeze(2)).log()-alignment_probs1.unsqueeze(1).log()).clamp_max(max=0.0),
+                            torch.zeros_like(alignment_probs1.unsqueeze(1).repeat(1, document_length, 1, 1))
+                        ).sum()/(text_mask.sum(1).float()*(text_mask.sum(1).float()-1)*parallel_text_mask.sum(1).float()).sum()
+                        alignment2_loss = torch.where(
+                            text_mask.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, parallel_text_mask.shape[1], parallel_text_mask.shape[1]) & parallel_text_mask.unsqueeze(1).unsqueeze(1).repeat(1, document_length, parallel_text_mask.shape[1], 1) & (1-torch.eye(alignment_probs2.shape[-1]).unsqueeze(0).unsqueeze(0).repeat(batch_size, document_length, 1, 1).to(text_mask.device) > 0),
+                            ((1.-alignment_probs2.unsqueeze(3)).log()-alignment_probs2.unsqueeze(2).log()).clamp_max(max=0.0),
+                            torch.zeros_like(alignment_probs2.unsqueeze(-1).repeat(1, 1, 1, parallel_text_mask.shape[1]))
+                        ).sum()/(text_mask.sum(1).float()*(parallel_text_mask.sum(1).float()-1)*parallel_text_mask.sum(1).float()).sum()
+                        parallel_consistency_loss -= alignment1_loss+alignment2_loss"""
+                        loss += self._parallel_consistency_coefficient*parallel_consistency_loss
+                        """alignment_agreement_loss = torch.where(
+                            text_mask.unsqueeze(-1) & parallel_text_mask.unsqueeze(1) & (~torch.isinf(alignment_probs1.log()-alignment_probs2.log())),
+                            alignment_probs1.log()-alignment_probs2.log(),
+                            torch.zeros_like(alignment_probs1)
+                        ).abs()
+                        alignment_agreement_loss = alignment_agreement_loss.sum(-1).sum(-1).mean()
+                        loss += self._parallel_alignment_agreement_coefficient*alignment_agreement_loss"""
+                else:
+                    tag_counts = []
+                    for outputs, mask in zip([classifier_outputs, parallel_classifier_outputs], [text_mask, parallel_text_mask]):
+                        viterbi_output = self.ner_crf.viterbi_tags(
+                            outputs,
+                            mask,
+                            top_k=1
+                        )
+                        predicted_tags = cast(List[List[int]], [x[0][0] for x in viterbi_output])
+                        # Represent viterbi tags as "class probabilities" that we can
+                        # feed into the metrics
+                        class_probabilities = classifier_outputs * 0.0
+                        tags = [{} for _ in predicted_tags]
+                        for i, instance_tags in enumerate(predicted_tags):
+                            for j, tag_id in enumerate(instance_tags):
+                                string_label = self.vocab.get_token_from_index(tag_id, namespace="ner_seq_labels")
+                                if string_label[:2] == "B-":
+                                    print(len(tag_counts), string_label)
+                                    if tag_id not in tags:
+                                        tags[i][tag_id] = 0
+                                    tags[i][tag_id] += 1
+                        tag_counts.append(tags)
+                    self._parallel_consistency_metric(*tag_counts)
         elif self._predict_ner and self._ner_sequence and self._ner_tag_embedding_dim > 0:
             # Shape: (batch_size, document_length, num_tags)
             scores = self._ner_scorer(contextualized_embeddings)
@@ -634,14 +907,16 @@ class CoreferenceResolver(Model):
             span_start_scores = self._mention_scorer_start(start_representations).squeeze(-1)
             span_end_scores = self._mention_scorer_end(end_representations).squeeze(-1)
             # Shape: (batch_size, document_length, document_length)
-            """span_bilinear_scores = self._mention_scorer_bilinear(
-                    start_representations,
-                    end_representations
-            ).view(batch_size, document_length, document_length)"""
-            span_bilinear_scores = torch.matmul(
-                self._mention_scorer_bilinear(start_representations),
-                end_representations.permute(0, 2, 1),
-            ).view(batch_size, document_length, document_length)
+            if self._non_span_rep_refactor:
+                span_bilinear_scores = torch.matmul(
+                    self._mention_scorer_bilinear(start_representations),
+                    end_representations.permute(0, 2, 1),
+                ).view(batch_size, document_length, document_length)
+            else:
+                span_bilinear_scores = self._mention_scorer_bilinear(
+                        start_representations,
+                        end_representations
+                ).view(batch_size, document_length, document_length)
             # Shape: (batch_size, num_spans)
             span_mention_start_scores = torch.gather(span_start_scores, 1, spans[:,:,0])
             span_mention_end_scores = torch.gather(span_end_scores, 1, spans[:,:,1])
@@ -667,34 +942,39 @@ class CoreferenceResolver(Model):
             span_mention_scores = self._mention_scorer(
                 transformed_span_embeddings
             ).squeeze(-1)
-        # Shape: (batch_size, num_spans) for all 3 tensors
-        top_span_mention_scores, top_span_mask, top_span_indices = util.masked_topk(
-            span_mention_scores, span_mask, num_spans_to_keep
-        )
 
-        # Shape: (batch_size * num_spans_to_keep)
-        # torch.index_select only accepts 1D indices, but here
-        # we need to select spans for each element in the batch.
-        # This reformats the indices to take into account their
-        # index into the batch. We precompute this here to make
-        # the multiple calls to util.batched_index_select below more efficient.
-        flat_top_span_indices = util.flatten_and_batch_shift_indices(top_span_indices, num_spans)
-
-        # Compute final predictions for which spans to consider as mentions.
-        # Shape: (batch_size, num_spans_to_keep, 2)
-        top_spans = util.batched_index_select(spans, top_span_indices, flat_top_span_indices)
-        if not self._non_span_rep_model:
-            # Shape: (batch_size, num_spans_to_keep, embedding_size)
-            top_span_embeddings = util.batched_index_select(
-                span_embeddings, top_span_indices, flat_top_span_indices
+        if self._predict_coref or (self._predict_srl and self._srl_e2e):
+            # Shape: (batch_size, num_spans_to_keep) for all 3 tensors
+            top_span_mention_scores, top_span_mask, top_span_indices = util.masked_topk(
+                span_mention_scores, span_mask, num_spans_to_keep
             )
 
-        output_dict = {
-            "top_spans": top_spans,
-            "all_spans": spans,
-            "top_span_indices": top_span_indices,
-            "span_mention_scores": span_mention_scores
-        }
+            # Shape: (batch_size * num_spans_to_keep)
+            # torch.index_select only accepts 1D indices, but here
+            # we need to select spans for each element in the batch.
+            # This reformats the indices to take into account their
+            # index into the batch. We precompute this here to make
+            # the multiple calls to util.batched_index_select below more efficient.
+            flat_top_span_indices = util.flatten_and_batch_shift_indices(top_span_indices, num_spans)
+
+            # Compute final predictions for which spans to consider as mentions.
+            # Shape: (batch_size, num_spans_to_keep, 2)
+            top_spans = util.batched_index_select(spans, top_span_indices, flat_top_span_indices)
+            if not self._non_span_rep_model:
+                # Shape: (batch_size, num_spans_to_keep, embedding_size)
+                top_span_embeddings = util.batched_index_select(
+                    span_embeddings, top_span_indices, flat_top_span_indices
+                )
+
+            # Shape: (batch_size, num_spans_to_keep)
+            span_loss_mask = torch.gather(span_loss_mask, dim=1, index=top_span_indices)
+
+            output_dict = {
+                "top_spans": top_spans,
+                "all_spans": spans,
+                "top_span_indices": top_span_indices,
+                "span_mention_scores": span_mention_scores
+            }
 
         if self._predict_srl and self._srl_e2e:
             # word_span_mask = word_span_mask.to_dense()
@@ -790,49 +1070,65 @@ class CoreferenceResolver(Model):
                 argument_scores, combined_mask.unsqueeze(-1).repeat(1, 1, 1, num_labels+1), util.min_value_of_dtype(argument_scores.dtype)
             )
             if self._lpsmap:
-                """if num_spans_to_keep < self._max_num_spans:
-                    # Shape: (batch_size, num_predicate_candidates_to_keep, max_num_spans, num_labels+1)
-                    argument_scores = torch.cat((argument_scores, torch.ones_like(argument_scores[:,:,:1,:]).repeat(1, 1, self._max_num_spans-num_spans_to_keep, 1)*util.min_value_of_dtype(argument_scores.dtype)), dim=2)
-                if num_predicate_candidates_to_keep < self._max_num_predicates:
-                    # Shape: (batch_size, max_num_predicates, max_num_spans, num_labels+1)
-                    argument_scores = torch.cat((argument_scores, torch.ones_like(argument_scores[:,:1,:,:]).repeat(1, self._max_num_predicates-num_predicate_candidates_to_keep, 1, 1)*util.min_value_of_dtype(argument_scores.dtype)), dim=1)
-                if self._batch_lpsmap is None:
-                    self._batch_lpsmap = BatchLpsmap(self.num_variables, self.constraint_types, self.constraint_sizes, self.constraint_sets, self.budgets, self.negated, self.coefficients, argument_scores.device, batch_size*self._max_num_predicates, max_iter=self._lpsmap_max_iter)
+                effective_batch_size = batch_size*argument_scores.shape[1]
+                self.setup_constraints(argument_scores.shape[2], document_length, top_spans, effective_batch_size)
+                if self._lpsmap_overlapping_spans_srl:
+                    argument_scores = torch.cat((argument_scores, torch.ones_like(argument_scores[:,:,:,:1])*util.min_value_of_dtype(argument_scores.dtype)), dim=-1)
+                batch_lpsmap = BatchLpsmap(argument_scores[0,0,:,:].numel(), self.constraint_types, self.constraint_sizes, self.constraint_sets, self.budgets, self.negated, self.coefficients, argument_scores.device, effective_batch_size, max_iter=self._lpsmap_max_iter, non_uniform_constraint_types=self.non_uniform_constraint_types, non_uniform_constraint_sizes=self.non_uniform_constraint_sizes, non_uniform_constraint_sets=self.non_uniform_constraint_sets, non_uniform_constraint_budgets=self.non_uniform_constraint_budgets, non_uniform_constraint_negated=self.non_uniform_constraint_negated, non_uniform_constraint_coefficients=self.non_uniform_constraint_coefficients)
                 with torch.no_grad():
-                    argument_probs = self._batch_lpsmap(argument_scores.view(batch_size*self._max_num_predicates, -1)).view(batch_size, self._max_num_predicates, self._max_num_spans, num_labels+1)
-                argument_scores = argument_scores[:,:num_predicate_candidates_to_keep,:num_spans_to_keep,:].contiguous()
-                argument_probs = argument_probs[:,:num_predicate_candidates_to_keep,:num_spans_to_keep,:].contiguous()"""
-                word_span_mask = word_span_mask.to_dense()
-                # Shape: (batch_size, document_length, num_spans_to_keep)
-                word_span_mask = torch.gather(word_span_mask, 2, top_span_indices.unsqueeze(1).repeat(1, word_span_mask.shape[1], 1))
-                with torch.no_grad():
+                    argument_probs = batch_lpsmap(argument_scores.view(effective_batch_size, -1)).view(batch_size, argument_scores.shape[1], argument_scores.shape[2], argument_scores.shape[3])
+                if self._lpsmap_overlapping_spans_srl:
+                    argument_probs = argument_probs[:,:,:,:-1].contiguous()
+                    argument_scores = argument_scores[:,:,:,:-1].contiguous()
+                """with torch.no_grad():
                     argument_probs = []
+                    fg = TorchFactorGraph()
+                    x = fg.variable_from(argument_scores.cpu())
                     for i in range(batch_size):
                         results = []
                         for j in range(num_predicate_candidates_to_keep):
-                            fg = TorchFactorGraph()
-                            x = fg.variable_from(argument_scores[i,j,:,:].cpu())
                             for s in range(num_spans_to_keep):
-                                fg.add(Xor(x[s,:]))
+                                fg.add(Xor(x[i,j,s,:]))
                             label_vocab = self.vocab.get_token_to_index_vocabulary()
                             for l in self.core_role_labels:
-                                fg.add(AtMostOne(x[:,l+1]))
+                                fg.add(AtMostOne(x[i,j,:,l+1]))
                             if self._lpsmap_overlapping_spans_srl:
                                 for word in range(document_length):
-                                    spans_including_word = word_span_mask[i,word,:].nonzero().tolist()
+                                    spans_including_word_mask = (top_spans[i,:,0] <= word) & (top_spans[i,:,1] >= word)
+                                    spans_including_word = spans_including_word_mask.nonzero().tolist()
+                                    assert ((top_spans[i,spans_including_word,0] <= word) & (top_spans[i,spans_including_word,1] >= word)).all().item()
                                     if len(spans_including_word) > 1:
-                                        fg.add(AtMostOne(x[spans_including_word,1:]))
-                            fg.solve(max_iter=self._lpsmap_max_iter)
-                            results.append(x.value.to(argument_scores.device))
-                        argument_probs.append(torch.stack(results))
-                    argument_probs = torch.stack(argument_probs)
+                                        fg.add(AtMostOne(x[i,j,spans_including_word,1:]))
+                            # fg.solve(max_iter=self._lpsmap_max_iter)
+                            # results.append(x.value.to(argument_scores.device))
+                        # argument_probs.append(torch.stack(results))
+                    fg.solve(max_iter=self._lpsmap_max_iter)
+                    argument_probs = x.value.to(argument_scores.device)
+                    # argument_probs = torch.stack(argument_probs)"""
             else:
                 argument_probs = argument_scores.softmax(dim=-1)
             predicted_tags = [[] for _ in range(batch_size)]
-            predicted_indices = ((argument_probs.argmax(-1) > 0) & combined_mask).nonzero()
-            for i in range(predicted_indices.shape[0]):
-                batch_index, predicate_index, span_index = predicted_indices[i,:].tolist()
-                predicted_tags[batch_index].append((top_predicate_indices[batch_index,predicate_index].item(), (top_spans[batch_index,span_index,0].item(), top_spans[batch_index,span_index,1].item(), self.vocab.get_token_from_index(argument_probs[batch_index,predicate_index,span_index,:].argmax().item()-1, namespace="srl_labels"))))
+            if self._srl_dp_decode and not self.training:
+                label_vocab = self.vocab.get_index_to_token_vocabulary(namespace="srl_labels")
+                for i in range(batch_size):
+                    pred_to_args = dp_decode(
+                        {
+                            "predicates": top_predicate_indices[i,:].tolist(),
+                            "arg_starts": top_spans[i,:,0].tolist(),
+                            "arg_ends": top_spans[i,:,1].tolist(),
+                            "arg_labels": argument_scores[i,:,:,:].argmax(-1).permute(1, 0).tolist(),
+                            "srl_scores": argument_scores[i,:,:].permute(1, 0, 2).tolist()
+                        },
+                        {j: label_vocab[j-1] if j > 0 else "null" for j in range(len(label_vocab)+1)}
+                    )
+                    for pred in pred_to_args:
+                        for arg in pred_to_args[pred]:
+                            predicted_tags[i].append((pred, arg))
+            else:
+                predicted_indices = ((argument_probs.argmax(-1) > 0) & combined_mask).nonzero()
+                for i in range(predicted_indices.shape[0]):
+                    batch_index, predicate_index, span_index = predicted_indices[i,:].tolist()
+                    predicted_tags[batch_index].append((top_predicate_indices[batch_index,predicate_index].item(), (top_spans[batch_index,span_index,0].item(), top_spans[batch_index,span_index,1].item(), self.vocab.get_token_from_index(argument_probs[batch_index,predicate_index,span_index,:].argmax().item()-1, namespace="srl_labels"))))
             output_dict["srl_predictions"] = predicted_tags
             # Shape: (batch_size, num_predicate_candidates_to_keep, num_spans_to_keep)
             # word_span_mask = torch.gather(word_span_mask, 2, top_span_indices.unsqueeze(1).repeat(1, word_span_mask.shape[1], 1))
@@ -935,83 +1231,71 @@ class CoreferenceResolver(Model):
 
         if self._predict_coref:
             if self._non_span_rep_model:
-                start_representations = self._start_feedforward2(contextualized_embeddings)
-                end_representations = self._end_feedforward2(contextualized_embeddings)
-                # Shape: (batch_size, document_length, document_length)
-                """antecedent_scores_start_start = self._antecedent_scorer_start_start(
-                    start_representations,
-                    start_representations
+                # Shape: (batch_size, num_spans_to_keep, embedding_size)
+                start_representations = self._start_feedforward2(
+                    torch.gather(
+                        contextualized_embeddings,
+                        dim=1,
+                        index=top_spans[:,:,:1].repeat(1, 1, contextualized_embeddings.shape[-1])
+                    )
                 )
-                antecedent_scores_start_end = self._antecedent_scorer_start_end(
-                    start_representations,
-                    end_representations
+                end_representations = self._end_feedforward2(
+                    torch.gather(
+                        contextualized_embeddings,
+                        dim=1,
+                        index=top_spans[:,:,1:].repeat(1, 1, contextualized_embeddings.shape[-1])
+                    )
                 )
-                antecedent_scores_end_start = self._antecedent_scorer_end_start(
-                    end_representations,
-                    start_representations
-                )
-                antecedent_scores_end_end = self._antecedent_scorer_end_end(
-                    end_representations,
-                    end_representations
-                )"""
-                antecedent_scores_start_start = torch.matmul(
-                    self._antecedent_scorer_start_start(start_representations),
-                    start_representations.permute(0, 2, 1)
-                )
-                antecedent_scores_start_end = torch.matmul(
-                    self._antecedent_scorer_start_end(start_representations),
-                    end_representations.permute(0, 2, 1)
-                )
-                antecedent_scores_end_start = torch.matmul(
-                    self._antecedent_scorer_end_start(end_representations),
-                    start_representations.permute(0, 2, 1)
-                )
-                antecedent_scores_end_end = torch.matmul(
-                    self._antecedent_scorer_end_end(end_representations),
-                    end_representations.permute(0, 2, 1)
-                )
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
+                # Shape: (batch_size, num_spans_to_keep, num_spans_to_keep)
+                if self._non_span_rep_refactor:
+                    antecedent_scores_start_start = torch.matmul(
+                        self._antecedent_scorer_start_start(start_representations),
+                        start_representations.permute(0, 2, 1)
+                    )
+                    antecedent_scores_start_end = torch.matmul(
+                        self._antecedent_scorer_start_end(start_representations),
+                        end_representations.permute(0, 2, 1)
+                    )
+                    antecedent_scores_end_start = torch.matmul(
+                        self._antecedent_scorer_end_start(end_representations),
+                        start_representations.permute(0, 2, 1)
+                    )
+                    antecedent_scores_end_end = torch.matmul(
+                        self._antecedent_scorer_end_end(end_representations),
+                        end_representations.permute(0, 2, 1)
+                    )
+                else:
+                    antecedent_scores_start_start = self._antecedent_scorer_start_start(
+                        start_representations,
+                        start_representations
+                    )
+                    antecedent_scores_start_end = self._antecedent_scorer_start_end(
+                        start_representations,
+                        end_representations
+                    )
+                    antecedent_scores_end_start = self._antecedent_scorer_end_start(
+                        end_representations,
+                        start_representations
+                    )
+                    antecedent_scores_end_end = self._antecedent_scorer_end_end(
+                        end_representations,
+                        end_representations
+                    )
+                # Shape: (batch_size, num_spans_to_keep, num_spans_to_keep)
                 top_antecedent_indices = torch.arange(num_spans_to_keep).to(spans.device).unsqueeze(0).unsqueeze(0).repeat(batch_size, num_spans_to_keep, 1)
                 top_antecedent_mask = torch.tril(torch.ones_like(top_antecedent_indices).bool(), diagonal=-1)
+                top_antecedent_mask &= top_span_mask.unsqueeze(-1) & top_span_mask.unsqueeze(1) & span_loss_mask.unsqueeze(-1) & span_loss_mask.unsqueeze(1)
                 antecedent_mention_scores = top_span_mention_scores.unsqueeze(1).repeat(1, num_spans_to_keep, 1)
-                antecedent_starts = top_spans[:,:,0].unsqueeze(1).repeat(1, num_spans_to_keep, 1)
-                antecedent_ends = top_spans[:,:,1].unsqueeze(1).repeat(1, num_spans_to_keep, 1)
-                max_antecedents = top_antecedent_indices.shape[-1]
-                batch_range = torch.arange(batch_size).unsqueeze(-1).repeat(1, num_spans_to_keep*max_antecedents).view(-1)
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
-                antecedent_scores_start_start = antecedent_scores_start_start[
-                    batch_range,
-                    top_spans[:,:,:1].repeat(1, 1, max_antecedents).view(-1),
-                    antecedent_starts.view(-1)
-                ].view(batch_size, num_spans_to_keep, max_antecedents)
-                antecedent_scores_start_end = antecedent_scores_start_end[
-                    batch_range,
-                    top_spans[:,:,:1].repeat(1, 1, max_antecedents).view(-1),
-                    antecedent_ends.view(-1)
-                ].view(batch_size, num_spans_to_keep, max_antecedents)
-                antecedent_scores_end_start = antecedent_scores_end_start[
-                    batch_range,
-                    top_spans[:,:,1:].repeat(1, 1, max_antecedents).view(-1),
-                    antecedent_starts.view(-1)
-                ].view(batch_size, num_spans_to_keep, max_antecedents)
-                antecedent_scores_end_end = antecedent_scores_end_end[
-                    batch_range,
-                    top_spans[:,:,1:].repeat(1, 1, max_antecedents).view(-1),
-                    antecedent_ends.view(-1)
-                ].view(batch_size, num_spans_to_keep, max_antecedents)
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
-                coreference_scores = top_span_mention_scores.unsqueeze(-1).repeat(1, 1, max_antecedents)+antecedent_mention_scores+antecedent_scores_start_start+antecedent_scores_start_end+antecedent_scores_end_start+antecedent_scores_end_end
+                # Shape: (batch_size, num_spans_to_keep, num_spans_to_keep)
+                coreference_scores = top_span_mention_scores.unsqueeze(-1).repeat(1, 1, num_spans_to_keep)+antecedent_mention_scores+antecedent_scores_start_start+antecedent_scores_start_end+antecedent_scores_end_start+antecedent_scores_end_end
                 # top_antecedent_indices = top_antecedent_indices.unsqueeze(0).repeat(batch_size, 1, 1)
-                # Shape: (batch_size, num_spans_to_keep)
-                span_loss_mask = torch.gather(span_loss_mask, dim=1, index=top_span_indices)
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
-                top_antecedent_mask &= span_loss_mask.unsqueeze(2) & span_loss_mask.unsqueeze(1)
+
                 coreference_scores = util.replace_masked_values(
                     coreference_scores, top_antecedent_mask, util.min_value_of_dtype(coreference_scores.dtype)
                 )
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents+1)
+                # Shape: (batch_size, num_spans_to_keep, num_spans_to_keep+1)
                 coreference_scores = torch.cat((torch.zeros_like(coreference_scores[:,:,:1]), coreference_scores), dim=-1)
-                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
+                # Shape: (batch_size, num_spans_to_keep, num_spans_to_keep)
                 # top_antecedent_mask = top_antecedent_mask.repeat(batch_size, 1, 1)
                 flat_top_antecedent_indices = util.flatten_and_batch_shift_indices(
                     top_antecedent_indices, num_spans_to_keep
@@ -1056,6 +1340,14 @@ class CoreferenceResolver(Model):
                 top_antecedent_embeddings = util.batched_index_select(
                     top_span_embeddings, top_antecedent_indices, flat_top_antecedent_indices
                 )
+                top_antecedent_mask &= span_loss_mask.unsqueeze(-1)
+                # Shape: (batch_size, num_spans_to_keep, max_antecedents)
+                span_loss_mask = torch.gather(
+                    span_loss_mask.unsqueeze(1).repeat(1, num_spans_to_keep, 1),
+                    dim=2,
+                    index=top_antecedent_indices
+                )
+                top_antecedent_mask &= span_loss_mask
                 # Shape: (batch_size, num_spans_to_keep, 1 + max_antecedents)
                 coreference_scores = self._compute_coreference_scores(
                     top_span_embeddings,
@@ -1109,7 +1401,6 @@ class CoreferenceResolver(Model):
             # is greater than -1.
             predicted_antecedents -= 1
 
-
             output_dict["antecedent_indices"] = top_antecedent_indices
             output_dict["antecedent_mask"] = top_antecedent_mask
             output_dict["predicted_antecedents"] = predicted_antecedents
@@ -1124,6 +1415,7 @@ class CoreferenceResolver(Model):
             output_dict["coreference_log_probs"] = coreference_log_probs
             output_dict["coreference_scores"] = coreference_scores
             if span_labels is not None:
+                assert span_labels.shape[1] == spans.shape[1]
                 # Find the gold labels for the spans which we kept.
                 # Shape: (batch_size, num_spans_to_keep, 1)
                 pruned_gold_labels = util.batched_index_select(
@@ -1158,9 +1450,14 @@ class CoreferenceResolver(Model):
                 negative_marginal_log_likelihood = -util.logsumexp(correct_antecedent_log_probs).mean()
 
                 self._mention_recall(top_spans, metadata)
-                self._conll_coref_scores(
-                    top_spans, top_antecedent_indices, metadata, predicted_antecedents
-                )
+                if consistency_metric:
+                    self._consistency_conll_coref_scores(
+                        top_spans, top_antecedent_indices, metadata, predicted_antecedents
+                    )
+                else:
+                    self._conll_coref_scores(
+                        top_spans, top_antecedent_indices, metadata, predicted_antecedents
+                    )
                 loss += negative_marginal_log_likelihood
                 output_dict["gold_clusters"] = [x["clusters"] for x in metadata]
 
@@ -1282,75 +1579,78 @@ class CoreferenceResolver(Model):
 
         # A tensor of shape (batch_size, num_spans_to_keep, 2), representing
         # the start and end indices of each span.
-        batch_top_spans = output_dict["top_spans"].detach().cpu()
+        if "top_spans" in output_dict:
+            batch_top_spans = output_dict["top_spans"].detach().cpu()
 
-        # A tensor of shape (batch_size, num_spans_to_keep) representing, for each span,
-        # the index into `antecedent_indices` which specifies the antecedent span. Additionally,
-        # the index can be -1, specifying that the span has no predicted antecedent.
-        batch_predicted_antecedents = output_dict["predicted_antecedents"].detach().cpu()
+            # A tensor of shape (batch_size, num_spans_to_keep) representing, for each span,
+            # the index into `antecedent_indices` which specifies the antecedent span. Additionally,
+            # the index can be -1, specifying that the span has no predicted antecedent.
+            batch_predicted_antecedents = output_dict["predicted_antecedents"].detach().cpu()
 
-        # A tensor of shape (num_spans_to_keep, max_antecedents), representing the indices
-        # of the predicted antecedents with respect to the 2nd dimension of `batch_top_spans`
-        # for each antecedent we considered.
-        batch_antecedent_indices = output_dict["antecedent_indices"].detach().cpu()
-        batch_clusters: List[List[List[Tuple[int, int]]]] = []
+            # A tensor of shape (num_spans_to_keep, max_antecedents), representing the indices
+            # of the predicted antecedents with respect to the 2nd dimension of `batch_top_spans`
+            # for each antecedent we considered.
+            batch_antecedent_indices = output_dict["antecedent_indices"].detach().cpu()
+            batch_clusters: List[List[List[Tuple[int, int]]]] = []
 
-        # Calling zip() on two tensors results in an iterator over their
-        # first dimension. This is iterating over instances in the batch.
-        for top_spans, predicted_antecedents, antecedent_indices in zip(
-            batch_top_spans, batch_predicted_antecedents, batch_antecedent_indices
-        ):
-            spans_to_cluster_ids: Dict[Tuple[int, int], int] = {}
-            clusters: List[List[Tuple[int, int]]] = []
+            # Calling zip() on two tensors results in an iterator over their
+            # first dimension. This is iterating over instances in the batch.
+            for top_spans, predicted_antecedents, antecedent_indices in zip(
+                batch_top_spans, batch_predicted_antecedents, batch_antecedent_indices
+            ):
+                spans_to_cluster_ids: Dict[Tuple[int, int], int] = {}
+                clusters: List[List[Tuple[int, int]]] = []
 
-            for i, (span, predicted_antecedent) in enumerate(zip(top_spans, predicted_antecedents)):
-                if predicted_antecedent < 0:
-                    # We don't care about spans which are
-                    # not co-referent with anything.
-                    continue
+                for i, (span, predicted_antecedent) in enumerate(zip(top_spans, predicted_antecedents)):
+                    if predicted_antecedent < 0:
+                        # We don't care about spans which are
+                        # not co-referent with anything.
+                        continue
 
-                # Find the right cluster to update with this span.
-                # To do this, we find the row in `antecedent_indices`
-                # corresponding to this span we are considering.
-                # The predicted antecedent is then an index into this list
-                # of indices, denoting the span from `top_spans` which is the
-                # most likely antecedent.
-                predicted_index = antecedent_indices[i, predicted_antecedent]
+                    # Find the right cluster to update with this span.
+                    # To do this, we find the row in `antecedent_indices`
+                    # corresponding to this span we are considering.
+                    # The predicted antecedent is then an index into this list
+                    # of indices, denoting the span from `top_spans` which is the
+                    # most likely antecedent.
+                    predicted_index = antecedent_indices[i, predicted_antecedent]
 
-                antecedent_span = (
-                    top_spans[predicted_index, 0].item(),
-                    top_spans[predicted_index, 1].item(),
-                )
+                    antecedent_span = (
+                        top_spans[predicted_index, 0].item(),
+                        top_spans[predicted_index, 1].item(),
+                    )
 
-                # Check if we've seen the span before.
-                if antecedent_span in spans_to_cluster_ids:
-                    predicted_cluster_id: int = spans_to_cluster_ids[antecedent_span]
-                else:
-                    # We start a new cluster.
-                    predicted_cluster_id = len(clusters)
-                    # Append a new cluster containing only this span.
-                    clusters.append([antecedent_span])
-                    # Record the new id of this span.
-                    spans_to_cluster_ids[antecedent_span] = predicted_cluster_id
+                    # Check if we've seen the span before.
+                    if antecedent_span in spans_to_cluster_ids:
+                        predicted_cluster_id: int = spans_to_cluster_ids[antecedent_span]
+                    else:
+                        # We start a new cluster.
+                        predicted_cluster_id = len(clusters)
+                        # Append a new cluster containing only this span.
+                        clusters.append([antecedent_span])
+                        # Record the new id of this span.
+                        spans_to_cluster_ids[antecedent_span] = predicted_cluster_id
 
-                # Now add the span we are currently considering.
-                span_start, span_end = span[0].item(), span[1].item()
-                clusters[predicted_cluster_id].append((span_start, span_end))
-                spans_to_cluster_ids[(span_start, span_end)] = predicted_cluster_id
-            batch_clusters.append(clusters)
+                    # Now add the span we are currently considering.
+                    span_start, span_end = span[0].item(), span[1].item()
+                    clusters[predicted_cluster_id].append((span_start, span_end))
+                    spans_to_cluster_ids[(span_start, span_end)] = predicted_cluster_id
+                batch_clusters.append(clusters)
 
-        output_dict["clusters"] = batch_clusters
+            output_dict["clusters"] = batch_clusters
         return output_dict
 
     @overrides
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
         mention_recall = self._mention_recall.get_metric(reset)
         coref_precision, coref_recall, coref_f1 = self._conll_coref_scores.get_metric(reset)
+        _, _, consistency_coref_f1 = self._consistency_conll_coref_scores.get_metric(reset)
 
         metrics = {
             "coref_precision": coref_precision,
             "coref_recall": coref_recall,
             "coref_f1": coref_f1,
+            "consistency_coref_f1": consistency_coref_f1,
             "mention_recall": mention_recall,
         }
         if self._predict_srl:
@@ -1374,6 +1674,10 @@ class CoreferenceResolver(Model):
                     metrics["recall"] = ner_metrics["recall"]
                 except RuntimeError:
                     metrics["ner_f1"] = 0
+        if self._parallel_consistency:
+            consistency_metrics = self._parallel_consistency_metric.get_metric(reset)
+            for metric in consistency_metrics:
+                metrics["parallel_"+metric] = consistency_metrics[metric]
         return metrics
 
     @staticmethod
