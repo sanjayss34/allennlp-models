@@ -31,10 +31,10 @@ from allennlp_models.structured_prediction.modules.lpsmap_loss import LpsmapLoss
 from allennlp_models.structured_prediction.tools.srl_dp_decode import dp_decode
 from allennlp_models.structured_prediction.metrics.consistency import StructureConsistencyMetric
 
-from lpsmap import TorchFactorGraph, Xor, Budget, AtMostOne, Imply
+# from lpsmap import TorchFactorGraph, Xor, Budget, AtMostOne, Imply
 
 import torch_struct
-from entmax import sparsemax, entmax15
+from entmax import sparsemax, entmax15, SparsemaxLoss
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,7 @@ class CoreferenceResolver(Model):
         ner_sequence_sparsemax: bool = False,
         ner_feedforward: Seq2SeqEncoder = None,
         ner_scorer: FeedForward = None,
+        ner_use_crf: bool = True,
         language_masking_map: Dict[str, bool] = None,
         only_language_masking_map: Dict[str, bool] = None,
         consistency_map: Dict[str, bool] = None,
@@ -147,9 +148,12 @@ class CoreferenceResolver(Model):
         parallel_alignment_activation: str = "softmax",
         parallel_alignment_attention: MatrixAttention = None,
         parallel_consistency_coefficient: float = 1.0,
+        parallel_consistency_threshold: float = 0.0,
+        parallel_consistency_weak: bool = False,
         parallel_alignment_agreement_coefficient: float = 1.0,
         parallel_lpsmap: bool = False,
         parallel_asymmetric: bool = False,
+        parallel_bag_loss: bool = False,
         initializer: InitializerApplicator = InitializerApplicator(),
         **kwargs
     ) -> None:
@@ -227,7 +231,7 @@ class CoreferenceResolver(Model):
         self._parallel_lpsmap = parallel_lpsmap
         self._parallel_asymmetric = parallel_asymmetric
         if parallel_consistency:
-            self._parallel_consistency_metric = StructureConsistencyMetric()
+            self._parallel_consistency_metric = StructureConsistencyMetric(weak=parallel_consistency_weak)
             activations = {"softmax": torch.nn.functional.softmax,
                            "sparsemax": sparsemax,
                            "entmax15": entmax15}
@@ -236,6 +240,8 @@ class CoreferenceResolver(Model):
             self._parallel_consistency_coefficient = parallel_consistency_coefficient
             self._parallel_consistency_labels = [i for i in range(self.vocab.get_vocab_size("ner_seq_labels")) if self.vocab.get_token_from_index(i, namespace="ner_seq_labels")[:2] == "B-"]
             self._parallel_alignment_agreement_coefficient = parallel_alignment_agreement_coefficient
+            self._parallel_consistency_threshold = parallel_consistency_threshold
+            self._parallel_bag_loss = parallel_bag_loss
 
         self._predict_srl = predict_srl
         self._predict_coref = predict_coref
@@ -317,6 +323,14 @@ class CoreferenceResolver(Model):
                 self.ner_crf = ConditionalRandomField(
                     self.vocab.get_vocab_size(label_namespace), constraints, include_start_end_transitions=True
                 )
+                self._ner_use_crf = ner_use_crf
+                if not ner_use_crf:
+                    self.ner_crf.transitions = torch.nn.Parameter(torch.zeros((len(labels), len(labels))))
+                    self.ner_crf.start_transitions = torch.nn.Parameter(torch.zeros((len(labels))))
+                    self.ner_crf.end_transitions = torch.nn.Parameter(torch.zeros((len(labels))))
+                    self.ner_crf.transitions.requires_grad = False
+                    self.ner_crf.start_transitions.requires_grad = False
+                    self.ner_crf.end_transitions.requires_grad = False
                 self._ner_sequence_sparsemax = ner_sequence_sparsemax
                 if ner_tag_embedding_dim > 0:
                     self._ner_tag_embeddings = torch.nn.Parameter(torch.zeros((len(labels), ner_tag_embedding_dim)))
@@ -689,8 +703,15 @@ class CoreferenceResolver(Model):
         output_dict = {}
         if self._predict_ner and self._ner_sequence and self._ner_tag_embedding_dim == 0:
             classifier_outputs = self._ner_scorer(contextualized_embeddings)
+            num_labels = classifier_outputs.shape[-1]
+            classifier_probs = torch.where(
+                text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                sparsemax(classifier_outputs), # .softmax(dim=-1),
+                torch.zeros_like(classifier_outputs)
+            )
+
             if not self.training:
-                viterbi_output = self.ner_crf.viterbi_tags(
+                """viterbi_output = self.ner_crf.viterbi_tags(
                     classifier_outputs,
                     text_mask,
                     top_k=1
@@ -702,10 +723,16 @@ class CoreferenceResolver(Model):
                 for i, instance_tags in enumerate(predicted_tags):
                     for j, tag_id in enumerate(instance_tags):
                         class_probabilities[i, j, tag_id] = 1
-                predicted_string_tags = [[self.vocab.get_token_from_index(i, namespace="ner_seq_labels") for i in lst] for lst in predicted_tags]
+                predicted_string_tags = [[self.vocab.get_token_from_index(i, namespace="ner_seq_labels") for i in lst] for lst in predicted_tags]"""
+                class_probabilities = classifier_probs
+                predicted_string_tags = [[self.vocab.get_token_from_index(classifier_outputs[i,j,:].argmax().item(), 'ner_seq_labels') for j in range(document_length)] for i in range(batch_size)]
                 output_dict["ner_predictions"] = predicted_string_tags
             if ner_seq_labels is not None:
-                loss += -self.ner_crf(classifier_outputs, ner_seq_labels, text_mask)/text_mask.sum().float()
+                if self._ner_use_crf:
+                    loss += -self.ner_crf(classifier_outputs, ner_seq_labels, text_mask)/text_mask.sum().float()
+                else:
+                    # loss += (torch.nn.CrossEntropyLoss(reduction='none')(classifier_outputs.view(-1, num_labels), ner_seq_labels.view(-1)).view(batch_size, document_length)*text_mask.float()).sum()/text_mask.float().sum()
+                    loss += (SparsemaxLoss(reduction="none")(classifier_outputs.view(-1, num_labels), ner_seq_labels.view(-1)).view(batch_size, document_length)*text_mask.float()).sum()/text_mask.float().sum()
                 if not self.training:
                     self._ner_metric(class_probabilities, ner_seq_labels, text_mask)
                     if metadata is not None:
@@ -726,9 +753,33 @@ class CoreferenceResolver(Model):
                     parallel_text_mask.unsqueeze(1).repeat(1, document_length, 1),
                     util.min_value_of_dtype(alignment_logits.dtype)
                 )
+                parallel_classifier_probs = torch.where(
+                    parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                    sparsemax(parallel_classifier_outputs), # .softmax(dim=-1),
+                    torch.zeros_like(parallel_classifier_outputs)
+                )
+                # print('a', [[self.vocab.get_token_from_index(classifier_probs[i,j,:].argmax().item(), 'ner_seq_labels') for j in range(document_length)] for i in range(batch_size)])
+                # print('b', [[self.vocab.get_token_from_index(parallel_classifier_probs[i,j,:].argmax().item(), "ner_seq_labels") for j in range(parallel_document_length)] for i in range(batch_size)])
+                # print('a', classifier_probs.sum(1)[:,self._parallel_consistency_labels])
+                # print('b', parallel_classifier_probs.sum(1)[:,self._parallel_consistency_labels])
                 if self.training:
+                    negative_infty = torch.log(torch.tensor(0.)).to(classifier_outputs.device)
+                    classifier_complement_probs = torch.where(text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-classifier_probs, 1.5*torch.ones_like(classifier_probs))
+                    parallel_classifier_complement_probs = torch.where(parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-parallel_classifier_probs, 1.5*torch.ones_like(parallel_classifier_probs))
+                    # classifier_log_probs = util.masked_log_softmax(classifier_outputs, text_mask.unsqueeze(-1))
+                    # parallel_classifier_log_probs = util.masked_log_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1))
+                    classifier_log_probs = torch.where(
+                        text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                        classifier_outputs.log_softmax(dim=-1),
+                        negative_infty*torch.ones_like(classifier_outputs)
+                    )
+                    parallel_classifier_log_probs = torch.where(
+                        parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                        parallel_classifier_outputs.log_softmax(dim=-1),
+                        negative_infty*torch.ones_like(parallel_classifier_outputs)
+                    )
+                    parallel_consistency_loss = 0.0
                     if self._parallel_lpsmap:
-                        num_labels = self.vocab.get_vocab_size("ner_seq_labels")
                         alignment_probs1 = []
                         alignment_probs2 = []
                         for i in range(batch_size):
@@ -736,62 +787,86 @@ class CoreferenceResolver(Model):
                             logits1 = torch.cat((classifier_outputs[i,:,:], alignment_logits[i,:,:]), dim=-1)
                             logits2 = torch.cat((parallel_classifier_outputs[i,:,:], alignment_logits.permute(0, 2, 1)[i,:,:]), dim=-1)
                             all_logits = torch.cat((logits1.view(-1), logits2.view(-1)), dim=0)
-                            x = fg.variable_from(all_logits.cpu())
+                            x = fg.variable_from(alignment_logits[i,:,:].cpu())
                             for index in range(document_length):
-                                # Exactly one label must be chosen for each position
-                                fg.add(Xor(x[[index*(num_labels+parallel_document_length)+label for label in range(num_labels)]]))
-                                for index2 in range(parallel_document_length):
-                                    # If no B- label is assigned to a position, that position shouldn't be aligned with any parallel position
-                                    fg.add(Imply(x[[index*(num_labels+parallel_document_length)+label for label in self._parallel_consistency_labels]+[index*(num_labels+parallel_document_length)+num_labels+index2]], negated=[True for _ in self._parallel_consistency_labels]+[True]))
-                                for label in self._parallel_consistency_labels:
-                                    # If position is not aligned with any parallel position, then no B- label should be assigned to this position
-                                    fg.add(Imply(x[[index*(num_labels+parallel_document_length)+num_labels+index2 for index2 in range(parallel_document_length)]+[index*(num_labels+parallel_document_length)+label]], negated=[True for _ in range(parallel_document_length+1)]))
-                                # Each position can be aligned with at most one parallel position
-                                fg.add(AtMostOne(x[[index*(num_labels+parallel_document_length)+num_labels+index2 for index2 in range(parallel_document_length)]]))
-                            for index2 in range(parallel_document_length):
-                                # Exactly one label must be chosen for each position
-                                fg.add(Xor(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label for label in range(num_labels)]]))
-                                for index in range(document_length):
-                                    # If no B- label is assigned to a position, that position shouldn't be aligned with any parallel position
-                                    fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label for label in self._parallel_consistency_labels]+[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index]], negated=[True for _ in self._parallel_consistency_labels]+[True]))
-                                for label in self._parallel_consistency_labels:
-                                    # If position is not aligned with any parallel position, then no B- label should be assigned to this position
-                                    fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index for index in range(document_length)]+[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label]], negated=[True for _ in range(document_length+1)]))
-                                # Each position can be aligned with at most one parallel position
-                                fg.add(AtMostOne(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index for index in range(document_length)]]))
-                            for index in range(document_length):
-                                for index2 in range(parallel_document_length):
-                                    for label in self._parallel_consistency_labels:
-                                        # Aligned positions must have the same label
-                                        fg.add(Imply(x[[index*(num_labels+parallel_document_length)+label, index*(num_labels+parallel_document_length)+num_labels+index2, document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label]]))
-                                        fg.add(Imply(x[[document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+label, document_length*(num_labels+parallel_document_length)+index2*(num_labels+document_length)+num_labels+index, index*(num_labels+parallel_document_length)+label]]))
+                                # Exactly one parallel position must be chosen for each source position
+                                fg.add(Xor(x[index,:]))
+                            for index in range(parallel_document_length):
+                                # At most one source token can be aligned to any given parallel position
+                                fg.add(AtMostOne(x[:,index]))
                             fg.solve(max_iter=self._lpsmap_max_iter)
-                            alignment_probs1.append(x.value[:document_length*(num_labels+parallel_document_length)].contiguous().view(document_length, num_labels+parallel_document_length)[:,num_labels:].to(all_logits.device))
-                            alignment_probs2.append(x.value[document_length*(num_labels+parallel_document_length):].contiguous().view(parallel_document_length, num_labels+document_length)[:,num_labels:].to(all_logits.device))
+                            alignment_probs1.append(x.value.to(alignment_logits.device))
+                            fg = TorchFactorGraph()
+                            x = fg.variable_from(alignment_logits[i,:,:].cpu())
+                            for index in range(document_length):
+                                fg.add(AtMostOne(x[index,:]))
+                            for index in range(parallel_document_length):
+                                fg.add(Xor(x[:,index]))
+                            fg.solve(max_iter=self._lpsmap_max_iter)
+                            alignment_probs2.append(x.value.to(alignment_logits.device))
                         alignment_probs1 = torch.stack(alignment_probs1)
                         alignment_probs2 = torch.stack(alignment_probs2)
-                        classifier_probs = classifier_outputs.softmax(dim=-1)
-                        parallel_classifier_probs = parallel_classifier_outputs.softmax(dim=-1)
-                        likelihood1 = (classifier_probs.unsqueeze(-2)*parallel_classifier_outputs.log_softmax(dim=-1).unsqueeze(1)*alignment_probs1.unsqueeze(-1)).sum()/(document_length*batch_size)
-                        likelihood2 = (parallel_classifier_probs.unsqueeze(-2)*classifier_outputs.log_softmax(dim=-1).unsqueeze(1)*alignment_probs2.unsqueeze(-1)).sum()/(parallel_document_length*batch_size)
-                        loss += self._parallel_consistency_coefficient*(-likelihood1-likelihood2)
+                        parallel_consistency_loss -= (classifier_probs[:,:,self._parallel_consistency_labels].unsqueeze(-2)*alignment_probs1.unsqueeze(-1)*classifier_probs.unsqueeze(-2)*(parallel_classifier_log_probs.unsqueeze(1)-classifier_log_probs.unsqueeze(-2))).sum()/batch_size
+                        parallel_consistency_loss -= (parallel_classifier_probs[:,:,self._parallel_consistency_labels].unsqueeze(1)*alignment_probs2.unsqueeze(-1)*parallel_classifier_probs.unsqueeze(1)*(classifier_log_probs.unsqueeze(-2)-parallel_classifier_log_probs.unsqueeze(1))).sum()/batch_size
+                    elif self._parallel_bag_loss:
+                        classifier_probs = torch.where(
+                            text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                            sparsemax(classifier_outputs),
+                            torch.zeros_like(classifier_outputs)
+                        )
+                        parallel_classifier_probs = torch.where(
+                            parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels),
+                            sparsemax(parallel_classifier_outputs),
+                            torch.zeros_like(parallel_classifier_outputs)
+                        )
+                        source_collapsed_probs = classifier_probs.sum(1) # [:,self._parallel_consistency_labels].contiguous()
+                        # source_collapsed_probs /= source_collapsed_probs.sum(-1).unsqueeze(-1)
+                        parallel_collapsed_probs = parallel_classifier_probs.sum(1) # [:,self._parallel_consistency_labels].contiguous()
+                        # parallel_collapsed_probs /= parallel_collapsed_probs.sum(-1).unsqueeze(-1)
+                        midpoint_log_probs = ((source_collapsed_probs+parallel_collapsed_probs)/2).log()
+                        # parallel_consistency_loss += (source_collapsed_probs*(source_collapsed_probs.log()-midpoint_log_probs))[:,self._parallel_consistency_labels].sum()/batch_size
+                        # parallel_consistency_loss += (parallel_collapsed_probs*(parallel_collapsed_probs.log()-midpoint_log_probs))[:,self._parallel_consistency_labels].sum()/batch_size
+                        parallel_consistency_loss += (source_collapsed_probs.detach()-parallel_collapsed_probs).abs()[:,self._parallel_consistency_labels].sum()/batch_size
                     else:
                         eps = 1e-10
-                        num_labels = self.vocab.get_vocab_size("ner_seq_labels")
                         alignment_probs1 = self._parallel_alignment_activation(alignment_logits, dim=-1) # .clamp(min=eps, max=1.-eps)
                         alignment_probs2 = self._parallel_alignment_activation(alignment_logits, dim=1) # .clamp(min=eps, max=1.-eps)
-                        classifier_probs = util.masked_softmax(classifier_outputs, text_mask.unsqueeze(-1), memory_efficient=True)
-                        parallel_classifier_probs = util.masked_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1), memory_efficient=True)
-                        classifier_complement_probs = torch.where(text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-classifier_probs, 1.5*torch.ones_like(classifier_probs))
-                        parallel_classifier_complement_probs = torch.where(parallel_text_mask.unsqueeze(-1).repeat(1, 1, num_labels), 1.-parallel_classifier_probs, 1.5*torch.ones_like(parallel_classifier_probs))
-                        classifier_log_probs = util.masked_log_softmax(classifier_outputs, text_mask.unsqueeze(-1))
-                        parallel_classifier_log_probs = util.masked_log_softmax(parallel_classifier_outputs, parallel_text_mask.unsqueeze(-1))
-                        parallel_consistency_loss = 0.0
                         for label in self._parallel_consistency_labels:
                             if self._parallel_asymmetric:
                                 parallel_consistency_loss -= (classifier_probs[:,:,label].max(1)[0].detach()*parallel_classifier_log_probs[:,:,label].max(1)[0]+classifier_complement_probs[:,:,label].min(1)[0].detach()*parallel_classifier_complement_probs[:,:,label].min(1)[0].log()).sum()/batch_size
                             else:
-                                parallel_consistency_loss -= (classifier_probs[:,:,label].max(1)[0]*parallel_classifier_log_probs[:,:,label].max(1)[0]+classifier_complement_probs[:,:,label].min(1)[0]*parallel_classifier_complement_probs[:,:,label].min(1)[0].log()).sum()/batch_size
+                                source_label_index = classifier_probs[:,:,label].argmax(1)
+                                parallel_label_index = parallel_classifier_probs[:,:,label].argmax(1)
+                                source_label_probs = classifier_probs.gather(dim=1, index=source_label_index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_labels)).view(batch_size, num_labels)
+                                source_label_log_probs = classifier_log_probs.gather(dim=1, index=source_label_index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_labels)).view(batch_size, num_labels)
+                                parallel_label_probs = parallel_classifier_probs.gather(dim=1, index=parallel_label_index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_labels)).view(batch_size, num_labels)
+                                parallel_label_log_probs = parallel_classifier_log_probs.gather(dim=1, index=parallel_label_index.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, num_labels)).view(batch_size, num_labels)
+                                loss_addition = torch.where(
+                                    ((source_label_probs.argmax(-1) == label) & (source_label_probs.max(-1)[0] > self._parallel_consistency_threshold)).unsqueeze(-1).repeat(1, num_labels),
+                                    -(source_label_probs*(parallel_label_log_probs-source_label_log_probs)),
+                                    torch.zeros_like(source_label_probs)
+                                ).sum()/batch_size
+                                if loss_addition.item() < 0:
+                                    print('a', label, loss_addition)
+                                    print(source_label_index, text_mask.int().sum(1))
+                                    print('b', source_label_probs, source_label_probs.sum(1))
+                                    print('c', parallel_label_probs, parallel_label_probs.sum(1))
+                                    print('d', source_label_log_probs)
+                                    print('e', parallel_label_log_probs)
+                                parallel_consistency_loss += loss_addition
+                                loss_addition = torch.where(
+                                    ((parallel_label_probs.argmax(-1) == label) & (parallel_label_probs.max(-1)[0] > self._parallel_consistency_threshold)).unsqueeze(-1).repeat(1, num_labels),
+                                    -(parallel_label_probs*(source_label_log_probs-parallel_label_log_probs)),
+                                    torch.zeros_like(parallel_label_probs)
+                                ).sum()/batch_size
+                                if loss_addition.item() < 0:
+                                    print('b', label, loss_addition)
+                                    print(source_label_index, text_mask.int().sum(1))
+                                    print('b', source_label_probs, source_label_probs.sum(1))
+                                    print('c', parallel_label_probs, parallel_label_probs.sum(1))
+                                    print('d', source_label_log_probs)
+                                    print('e', parallel_label_log_probs)
+                                parallel_consistency_loss += loss_addition
                             """alignment_score_product_dim1 = alignment_probs2*classifier_probs[:,:,label].unsqueeze(-1)
                             alignment_score_product_dim2 = alignment_probs1*parallel_classifier_probs[:,:,label].unsqueeze(1)
                             loss_contributions_dim2 = torch.where(
@@ -819,7 +894,6 @@ class CoreferenceResolver(Model):
                             torch.zeros_like(alignment_probs2.unsqueeze(-1).repeat(1, 1, 1, parallel_text_mask.shape[1]))
                         ).sum()/(text_mask.sum(1).float()*(parallel_text_mask.sum(1).float()-1)*parallel_text_mask.sum(1).float()).sum()
                         parallel_consistency_loss -= alignment1_loss+alignment2_loss"""
-                        loss += self._parallel_consistency_coefficient*parallel_consistency_loss
                         """alignment_agreement_loss = torch.where(
                             text_mask.unsqueeze(-1) & parallel_text_mask.unsqueeze(1) & (~torch.isinf(alignment_probs1.log()-alignment_probs2.log())),
                             alignment_probs1.log()-alignment_probs2.log(),
@@ -827,6 +901,7 @@ class CoreferenceResolver(Model):
                         ).abs()
                         alignment_agreement_loss = alignment_agreement_loss.sum(-1).sum(-1).mean()
                         loss += self._parallel_alignment_agreement_coefficient*alignment_agreement_loss"""
+                    loss += self._parallel_consistency_coefficient*parallel_consistency_loss
                 else:
                     tag_counts = []
                     for outputs, mask in zip([classifier_outputs, parallel_classifier_outputs], [text_mask, parallel_text_mask]):
@@ -844,11 +919,12 @@ class CoreferenceResolver(Model):
                             for j, tag_id in enumerate(instance_tags):
                                 string_label = self.vocab.get_token_from_index(tag_id, namespace="ner_seq_labels")
                                 if string_label[:2] == "B-":
-                                    print(len(tag_counts), string_label)
-                                    if tag_id not in tags:
+                                    print(len(tag_counts), string_label, i, j)
+                                    if tag_id not in tags[i]:
                                         tags[i][tag_id] = 0
                                     tags[i][tag_id] += 1
                         tag_counts.append(tags)
+                    print(tag_counts)
                     self._parallel_consistency_metric(*tag_counts)
         elif self._predict_ner and self._ner_sequence and self._ner_tag_embedding_dim > 0:
             # Shape: (batch_size, document_length, num_tags)
